@@ -1,0 +1,28 @@
+{
+  "p2_2": [
+    0.614251434803009,
+    -0.06953348219394684,
+    0.02215191163122654,
+    0.8344117999076843,
+    0.0,
+    0.0,
+    0.5511417388916016
+  ],
+  "p2_4": [
+    -0.09507976472377777,
+    -0.013847686350345612,
+    0.15167644619941711,
+    0.00898862536996603,
+    -0.9769138097763062,
+    -0.21326911449432373,
+    -0.008662326261401176
+  ],
+  "panda_joint_1_joint_type": "revolute",
+  "panda_joint_2_joint_type": "revolute",
+  "panda_joint_3_joint_type": "revolute",
+  "panda_joint_4_joint_type": "revolute",
+  "panda_joint_5_joint_type": "revolute",
+  "panda_joint_6_joint_type": "revolute",
+  "panda_joint_7_joint_type": "revolute",
+  "panda_finger_joint1_joint_type": "prismatic"
+}
