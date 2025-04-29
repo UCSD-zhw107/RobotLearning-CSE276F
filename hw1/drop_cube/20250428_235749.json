@@ -1,0 +1,29 @@
+{
+  "env_info": {
+    "env_id": "DropCubeInBinPanda-v1",
+    "env_kwargs": {
+      "num_envs": 1,
+      "control_mode": "pd_joint_delta_pos",
+      "render_mode": "rgb_array",
+      "reward_mode": "none",
+      "human_render_camera_configs": {
+        "shader_pack": "default"
+      }
+    },
+    "max_episode_steps": 50
+  },
+  "commit_info": null,
+  "episodes": [
+    {
+      "episode_id": 0,
+      "episode_seed": 42,
+      "control_mode": "pd_joint_delta_pos",
+      "elapsed_steps": 50,
+      "reset_kwargs": {
+        "options": {},
+        "seed": 42
+      },
+      "success": false
+    }
+  ]
+}
