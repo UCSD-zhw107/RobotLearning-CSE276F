@@ -178,6 +178,8 @@ class ThrowCubePandasEnv(BaseEnv):
 
         success = in_goal_region & has_landed
 
+        fail = cube_height < 0.0
+
         return {
             "success": success,
             "distance_xy_to_goal": distance_xy_to_goal,
@@ -185,6 +187,7 @@ class ThrowCubePandasEnv(BaseEnv):
             "has_landed": has_landed,
             "is_released": is_released,
             "cube_height": cube_height,
+            "fail": fail,
         }
     
 
@@ -265,5 +268,5 @@ class ThrowCubePandasEnv(BaseEnv):
     
 
     def compute_normalized_dense_reward(self, obs: Any, action: Array, info: Dict):
-        max_reward = 30.0
-        return self.compute_dense_reward(obs=obs, action=action, info=info)
+        max_reward = 20.0 # Maximum reward from success reward
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / max_reward
