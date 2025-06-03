@@ -11,8 +11,10 @@ from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.wrappers.record import RecordEpisode
 import torch
 from transforms3d.euler import euler2quat
-from env_cfg import EnvConfig
+from env_cfg import EnvConfig, RewardConfig
 from mani_skill.utils.building import actors
+from typing import Any, Dict
+from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
 
 @register_env("ThrowCubePandas-v1", max_episode_steps=200, override=True)
@@ -20,7 +22,7 @@ class ThrowCubePandasEnv(BaseEnv):
 
     def __init__(self, *args, robot_uids="panda", **kwargs):
         self.env_cfg = EnvConfig()
-
+        self.reward_cfg = RewardConfig()
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
 
@@ -132,55 +134,115 @@ class ThrowCubePandasEnv(BaseEnv):
             self._randomize_goal_position(b)
             
             # initialize throwing state tracking
-            self.cube_thrown = torch.zeros(b, dtype=torch.bool, device=self.device)
-            self.max_cube_height = torch.zeros(b, device=self.device)
-            self.throw_detected = torch.zeros(b, dtype=torch.bool, device=self.device)
+            self.prev_is_grasping = torch.zeros(b, dtype=torch.bool, device=self.device)
 
 
-    
+    def _check_release(self):
+        # check if cube is released
+        is_grasping = self.agent.is_grasping(self.cube)
+        just_released = self.prev_is_grasping & ~is_grasping
+        self.prev_is_grasping = is_grasping
+        
+        # velcoity check
+        vel_xy = self.cube.linear_velocity[..., :2]
+        speed_xy = torch.linalg.norm(vel_xy, dim=-1)
+        speed = torch.linalg.norm(self.cube.linear_velocity,  dim=-1)
+        vel_ok = (speed_xy > self.env_cfg.throw_vel_xy_threshold) | (speed < self.env_cfg.throw_vel_threshold)
+
+        # height check
+        cube_height = self.cube.pose.p[..., 2]
+        table_height = self.env_cfg.table_height
+        airborne = table_height + self.env_cfg.throw_air_threshold
+        height_ok = (cube_height > airborne)
+
+        # check if cube is released
+        return just_released & vel_ok & height_ok
+
+
     def evaluate(self) -> dict:
         # get cube and goalposition
         cube_pos = self.cube.pose.p
         goal_pos = self.goal_region.pose.p
 
         # check if cube is in goal region
-        distance_to_goal = torch.linalg.norm(cube_pos[..., :2] - goal_pos[..., :2], axis=1)
-        in_goal_region = distance_to_goal < self.env_cfg.goal_radius
-
-        # get cube height and velocity
-        cube_height = cube_pos[..., 2]
-        cube_velocity = torch.linalg.norm(self.cube.linear_velocity, axis=1)
-
-        # update max height
-        self.max_cube_height = torch.maximum(self.max_cube_height, cube_height)
+        distance_xy_to_goal = torch.linalg.norm(cube_pos[..., :2] - goal_pos[..., :2], dim=1)
+        in_goal_region = distance_xy_to_goal < self.env_cfg.goal_radius
 
         # check if cube is thrown
-        table_height = self.env_cfg.table_height
-        airborne = table_height + self.env_cfg.throw_air_threshold
-        is_current_airborne = (cube_height > airborne) & (cube_velocity > self.env_cfg.throw_velocity_threshold)
-        self.throw_detected = self.throw_detected | is_current_airborne
+        is_released = self._check_release()
 
         # check if cube has landed
+        table_height = self.env_cfg.table_height
+        cube_height = cube_pos[..., 2]
         has_landed = cube_height <= table_height + self.env_cfg.cube_halfsize
 
-        success = in_goal_region & self.throw_detected & has_landed
-
-        # additonal information
-        tcp_pos = self.agent.robot.links_map["panda_hand_tcp"].pose.p
-        tcp_to_cube_dist = torch.linalg.norm(tcp_pos - cube_pos, axis=1)
-        
-        # check if grasping
-        is_grasping = self.agent.is_grasping(self.cube)
+        success = in_goal_region & has_landed
 
         return {
             "success": success,
-            "distance_to_goal": distance_to_goal,
+            "distance_xy_to_goal": distance_xy_to_goal,
             "in_goal_region": in_goal_region,
-            "throw_detected": self.throw_detected,
-            "is_currently_airborne": is_current_airborne,
             "has_landed": has_landed,
-            "max_cube_height": self.max_cube_height,
-            "tcp_to_cube_dist": tcp_to_cube_dist,
-            "is_grasping": is_grasping,
+            "is_released": is_released,
             "cube_height": cube_height,
         }
+    
+
+    def _get_obs_extra(self, info: dict):
+        obs = dict(tcp_pose=self.agent.tcp.pose.raw_pose)
+        
+        if "state" in self._obs_mode:
+            obs.update(
+                cube_pose=self.cube.pose.raw_pose,
+                cube_velocity=self.cube.linear_velocity,
+                goal_pos=self.goal_region.pose.p,
+                tcp_velocity=self.agent.tcp.linear_velocity,
+            )
+        
+        return obs
+
+
+    def compute_dense_reward(self, obs: Any, action: Array, info: Dict):
+        # agent obs
+        agent_obs = obs['agent']
+        extra_obs = obs['extra']
+        
+        tcp_pos = extra_obs["tcp_pose"][:, :3]
+        cube_pos = extra_obs["cube_pose"][:, :3]
+        goal_pos = extra_obs["goal_pos"][:, :3]
+        
+        # stage 1: Reach and grasp cube
+        tcp_to_cube_dist = torch.linalg.norm(tcp_pos - cube_pos, dim=1)
+        reaching_reward = self.reward_cfg.approach_reward_weight * (1 - torch.tanh(5.0 * tcp_to_cube_dist))
+        is_grasping = self.agent.is_grasping(self.cube)
+        grasping_reward = self.reward_cfg.grasp_reward_weight * is_grasping
+
+        # stage 2: Lift cube
+        cube_height = cube_pos[..., 2]
+        lift_reward = self.reward_cfg.lift_reward_weight * (1 - torch.tanh(5.0 * (cube_height - self.reward_cfg.target_lift_height)))
+        
+        # stage 3: Throw cube
+        is_released = info["is_released"]
+        # velocity alignment reward
+        cube_vel = extra_obs["cube_velocity"]
+        velocity_direction = cube_vel / (torch.linalg.norm(cube_vel, dim=-1, keepdim=True) + 1e-6)
+        goal_direction = goal_pos - cube_pos
+        goal_direction[..., 2] = 0
+        goal_direction = goal_direction / (torch.linalg.norm(goal_direction, dim=-1, keepdim=True) + 1e-6)
+        alignment = (velocity_direction * goal_direction).sum(dim=-1) * self.reward_cfg.direction_align_reward_weight
+        # velocity magnitude reward
+        speed = torch.linalg.norm(cube_vel, dim=-1)
+        speed_bonus = torch.tanh(0.5 * speed) * self.reward_cfg.throw_reward_weight
+
+        reward = (reaching_reward + grasping_reward + lift_reward) * is_grasping
+        reward += (alignment + speed_bonus) * is_released
+
+        # stage 4: Success
+        if "success" in info:
+            reward[info["success"]] += self.reward_cfg.success_reward_weight
+        return reward
+    
+
+    def compute_normalized_dense_reward(self, obs: Any, action: Array, info: Dict):
+        max_reward = 30.0
+        return self.compute_dense_reward(obs=obs, action=action, info=info)

@@ -26,5 +26,31 @@ class EnvConfig:
     
 
     # evaluation config
-    throw_air_threshold: float = 0.05
-    throw_velocity_threshold: float = 0.05
+    throw_air_threshold: float = 0.1
+    throw_vel_xy_threshold: float = 0.5
+    throw_vel_threshold: float = 5.0
+
+
+
+@dataclass
+class RewardConfig:
+    # reward config
+    approach_reward_weight: float = 0.5
+    grasp_reward_weight: float = 1.0
+    grasp_stability_reward_weight: float = 0.2
+    lift_reward_weight: float = 1.0
+    direction_align_reward_weight: float = 0.5
+    throw_reward_weight: float = 2.0
+    airborne_reward_weight: float = 0.5
+    flight_accuracy_reward_weight: float = 1.0
+    landing_accuracy_reward_weight: float = 3.0
+    success_reward_weight: float = 10.0
+
+    # penalty config
+    drop_penalty_weight: float = -2.0
+    far_penalty_weight: float = -1.0
+    action_penalty_weight: float = -0.01
+
+
+    # reward config
+    target_lift_height: float = 0.1

@@ -14,6 +14,7 @@ from transforms3d.euler import euler2quat
 from env_cfg import EnvConfig
 from mani_skill.utils.building import actors
 from env import ThrowCubePandasEnv
+import mani_skill
 
 """
 This script is used to test the demo agents with random actions.
@@ -24,13 +25,17 @@ def main():
                 num_envs=1,
                 control_mode="pd_joint_delta_pos",
                 render_mode="rgb_array",
-                reward_mode="none",
-                human_render_camera_configs=dict(shader_pack="default")
+                reward_mode="dense",
+                human_render_camera_configs=dict(shader_pack="default"),
+                obs_mode="state"
     )
     env = RecordEpisode(env, output_dir="random_agents", video_fps=20, info_on_video=False)
-    env.reset(seed=42)
+    obs, info = env.reset(seed=42)
+    print("Action space:", env.action_space)
+    print("Observation space:", env.observation_space)
     for t in range(50):
-        _, _, _, _, info = env.step(env.action_space.sample())
+        obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+        break
     img = env.render().cpu().numpy()[0]
     print(f'Video saved to /random_agents')
     env.close()
