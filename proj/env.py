@@ -134,7 +134,10 @@ class ThrowCubePandasEnv(BaseEnv):
             self._randomize_goal_position(b)
             
             # initialize throwing state tracking
-            self.prev_is_grasping = torch.zeros(b, dtype=torch.bool, device=self.device)
+            if not hasattr(self, 'prev_is_grasping'):
+                self.prev_is_grasping = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            else:
+                self.prev_is_grasping[env_idx] = False
 
 
     def _check_release(self):

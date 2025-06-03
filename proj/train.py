@@ -21,6 +21,8 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
+from env import ThrowCubePandasEnv
+
 @dataclass
 class Args:
     exp_name: Optional[str] = None
@@ -465,7 +467,12 @@ if __name__ == "__main__":
             model_path = f"runs/{run_name}/final_ckpt.pt"
             torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")
-        logger.close()
+        try:
+            logger.close()
+        except Exception as e:
+            print(f"Warning: Error closing logger: {e}")
+            pass
+
     try:
         envs.close()
     except Exception as e:
