@@ -147,7 +147,7 @@ class ThrowCubePandasEnv(BaseEnv):
         vel_xy = self.cube.linear_velocity[..., :2]
         speed_xy = torch.linalg.norm(vel_xy, dim=-1)
         speed = torch.linalg.norm(self.cube.linear_velocity,  dim=-1)
-        vel_ok = (speed_xy > self.env_cfg.throw_vel_xy_threshold) | (speed < self.env_cfg.throw_vel_threshold)
+        vel_ok = (speed_xy > self.env_cfg.throw_vel_xy_threshold) & (speed > self.env_cfg.throw_vel_threshold)
 
         # height check
         cube_height = self.cube.pose.p[..., 2]
@@ -206,7 +206,9 @@ class ThrowCubePandasEnv(BaseEnv):
         # agent obs
         agent_obs = obs['agent']
         extra_obs = obs['extra']
-        
+        is_grasping = self.agent.is_grasping(self.cube)
+        reward = torch.zeros(is_grasping.shape[0], device=self.device)
+
         tcp_pos = extra_obs["tcp_pose"][:, :3]
         cube_pos = extra_obs["cube_pose"][:, :3]
         goal_pos = extra_obs["goal_pos"][:, :3]
@@ -214,33 +216,52 @@ class ThrowCubePandasEnv(BaseEnv):
         # stage 1: Reach and grasp cube
         tcp_to_cube_dist = torch.linalg.norm(tcp_pos - cube_pos, dim=1)
         reaching_reward = self.reward_cfg.approach_reward_weight * (1 - torch.tanh(5.0 * tcp_to_cube_dist))
-        is_grasping = self.agent.is_grasping(self.cube)
         grasping_reward = self.reward_cfg.grasp_reward_weight * is_grasping
+        reward += reaching_reward * (~is_grasping).float()
+        reward += grasping_reward
+
 
         # stage 2: Lift cube
         cube_height = cube_pos[..., 2]
-        lift_reward = self.reward_cfg.lift_reward_weight * (1 - torch.tanh(5.0 * (cube_height - self.reward_cfg.target_lift_height)))
+        lift_height = cube_height - self.env_cfg.table_height
+        lift_reward = self.reward_cfg.lift_reward_weight * torch.tanh(3.0 * lift_height)
+        reward += lift_reward * is_grasping.float()
+
         
         # stage 3: Throw cube
         is_released = info["is_released"]
-        # velocity alignment reward
-        cube_vel = extra_obs["cube_velocity"]
-        velocity_direction = cube_vel / (torch.linalg.norm(cube_vel, dim=-1, keepdim=True) + 1e-6)
-        goal_direction = goal_pos - cube_pos
-        goal_direction[..., 2] = 0
-        goal_direction = goal_direction / (torch.linalg.norm(goal_direction, dim=-1, keepdim=True) + 1e-6)
-        alignment = (velocity_direction * goal_direction).sum(dim=-1) * self.reward_cfg.direction_align_reward_weight
-        # velocity magnitude reward
-        speed = torch.linalg.norm(cube_vel, dim=-1)
-        speed_bonus = torch.tanh(0.5 * speed) * self.reward_cfg.throw_reward_weight
+        if is_released.any():
+            # velocity alignment reward
+            cube_vel = extra_obs["cube_velocity"]
+            velocity_direction = cube_vel / (torch.linalg.norm(cube_vel, dim=-1, keepdim=True) + 1e-6)
+            goal_direction = goal_pos - cube_pos
+            goal_direction[..., 2] = 0
+            goal_direction = goal_direction / (torch.linalg.norm(goal_direction, dim=-1, keepdim=True) + 1e-6)
+            alignment = (velocity_direction * goal_direction).sum(dim=-1) * self.reward_cfg.direction_align_reward_weight
+            alignment = torch.clamp(alignment, min=0.0)
 
-        reward = (reaching_reward + grasping_reward + lift_reward) * is_grasping
-        reward += (alignment + speed_bonus) * is_released
+            # velocity magnitude reward
+            speed = torch.linalg.norm(cube_vel, dim=-1)
+            speed_bonus = torch.tanh(0.5 * speed) * self.reward_cfg.throw_reward_weight
+
+            reward[is_released] += (alignment[is_released] + speed_bonus[is_released])
 
         # stage 4: Success
         if "success" in info:
             reward[info["success"]] += self.reward_cfg.success_reward_weight
+
+
+        # penalty
+        action_penalty = self.reward_cfg.action_penalty_weight * torch.norm(action, dim=-1)
+        reward += action_penalty
+
+        # drop penalty
+        drop_penalty = self.reward_cfg.drop_penalty_weight * (cube_pos[..., 2] < self.env_cfg.table_height)
+        reward += drop_penalty
+
+        # far penalty
         return reward
+        
     
 
     def compute_normalized_dense_reward(self, obs: Any, action: Array, info: Dict):

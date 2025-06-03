@@ -35,7 +35,6 @@ def main():
     print("Observation space:", env.observation_space)
     for t in range(50):
         obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
-        break
     img = env.render().cpu().numpy()[0]
     print(f'Video saved to /random_agents')
     env.close()
