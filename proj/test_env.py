@@ -220,7 +220,7 @@ class TestTaskEnv(BaseEnv):
         has_released = info.get("has_released", torch.zeros_like(is_grasping, dtype=torch.bool))
     
         # stage 1: Reach and grasp cube
-        stage1_mask = ~has_lifted_once
+        stage1_mask = ~has_lifted_once 
         if stage1_mask.any():
             tcp_to_cube_dist = torch.linalg.norm(cube_pos - tcp_pos, dim=1)
             reaching_reward = (1 - torch.tanh(5.0 * tcp_to_cube_dist))
@@ -244,6 +244,30 @@ class TestTaskEnv(BaseEnv):
         stage2_mask = has_lifted_once
         if stage2_mask.any():
             print(f'Number of has_lifted_once: {has_lifted_once.sum()}')
+            # Compute velocity direction toward goal
+            cube_to_goal = goal_pos - cube_pos
+            cube_to_goal_xy = cube_to_goal.clone()
+            cube_to_goal_xy[:, 2] = 0  # Only XY direction
+            cube_to_goal_dist = torch.linalg.norm(cube_to_goal_xy, dim=1)
+            cube_to_goal_dir = cube_to_goal_xy / (cube_to_goal_dist.unsqueeze(-1) + 1e-6)
+            
+            # Get velocity
+            velocity_xy = cube_velocity[:, :2]
+            velocity_magnitude = torch.linalg.norm(velocity_xy, dim=1)
+            
+            # Velocity direction alignment
+            velocity_dir = velocity_xy / (velocity_magnitude.unsqueeze(-1) + 1e-6)
+            direction_alignment = (cube_to_goal_dir[:, :2] * velocity_dir).sum(dim=1)
+            direction_reward = torch.clamp(direction_alignment, -1, 1) * 5.0  # -5 to +5
+            
+            # Velocity magnitude reward
+            magnitude_reward = torch.tanh(velocity_magnitude) * 3.0  # 0 to 3
+            
+            # Apply velocity rewards
+            has_velocity = velocity_magnitude > 0.01
+            reward[stage2_mask & has_velocity] += direction_reward[stage2_mask & has_velocity]
+            reward[stage2_mask & has_velocity] += magnitude_reward[stage2_mask & has_velocity]
+            
             # HUGE reward for NOT grasping (i.e., released)
             released = ~is_grasping & has_lifted_once
             reward[released] += 10.0  
