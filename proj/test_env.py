@@ -206,6 +206,29 @@ class TestTaskEnv(BaseEnv):
         return obs
 
 
+    def _compute_velocity_reward(self, cube_velocity: Array, goal_pos: Array, cube_pos: Array):
+        # Compute velocity direction toward goal
+        cube_to_goal = goal_pos - cube_pos
+        cube_to_goal_xy = cube_to_goal.clone()
+        cube_to_goal_xy[:, 2] = 0  # Only XY direction
+        cube_to_goal_dist = torch.linalg.norm(cube_to_goal_xy, dim=1)
+        cube_to_goal_dir = cube_to_goal_xy / (cube_to_goal_dist.unsqueeze(-1) + 1e-6)
+        
+        # Get velocity
+        velocity_xy = cube_velocity[:, :2]
+        velocity_magnitude = torch.linalg.norm(velocity_xy, dim=1)
+        
+        # Velocity direction alignment
+        velocity_dir = velocity_xy / (velocity_magnitude.unsqueeze(-1) + 1e-6)
+        direction_alignment = (cube_to_goal_dir[:, :2] * velocity_dir).sum(dim=1)
+        direction_reward = torch.clamp(direction_alignment, -1, 1) * 10.0  # -5 to +5
+        
+        # Velocity magnitude reward
+        magnitude_reward = torch.tanh(velocity_magnitude) * 10.0
+
+        return direction_reward, magnitude_reward
+
+
     def compute_dense_reward(self, obs: Any, action: Array, info: Dict):
         
         is_grasping = self.agent.is_grasping(self.cube)
@@ -220,7 +243,7 @@ class TestTaskEnv(BaseEnv):
         has_released = info.get("has_released", torch.zeros_like(is_grasping, dtype=torch.bool))
     
         # stage 1: Reach and grasp cube
-        stage1_mask = ~has_lifted_once 
+        stage1_mask = ~has_lifted_once & ~has_released
         if stage1_mask.any():
             tcp_to_cube_dist = torch.linalg.norm(cube_pos - tcp_pos, dim=1)
             reaching_reward = (1 - torch.tanh(5.0 * tcp_to_cube_dist))
@@ -241,9 +264,8 @@ class TestTaskEnv(BaseEnv):
             )
 
         # Stage 2: Release and throw (after lifted once)
-        stage2_mask = has_lifted_once
+        stage2_mask = has_lifted_once & ~has_released
         if stage2_mask.any():
-            print(f'Number of has_lifted_once: {has_lifted_once.sum()}')
             # Compute velocity direction toward goal
             cube_to_goal = goal_pos - cube_pos
             cube_to_goal_xy = cube_to_goal.clone()
@@ -258,23 +280,23 @@ class TestTaskEnv(BaseEnv):
             # Velocity direction alignment
             velocity_dir = velocity_xy / (velocity_magnitude.unsqueeze(-1) + 1e-6)
             direction_alignment = (cube_to_goal_dir[:, :2] * velocity_dir).sum(dim=1)
-            direction_reward = torch.clamp(direction_alignment, -1, 1) * 5.0  # -5 to +5
+            direction_reward = torch.clamp(direction_alignment, -1, 1) * 10.0  # -5 to +5
             
             # Velocity magnitude reward
-            magnitude_reward = torch.tanh(velocity_magnitude) * 3.0  # 0 to 3
+            magnitude_reward = torch.tanh(velocity_magnitude) * 10.0  # 0 to 3
             
             # Apply velocity rewards
             has_velocity = velocity_magnitude > 0.01
             reward[stage2_mask & has_velocity] += direction_reward[stage2_mask & has_velocity]
             reward[stage2_mask & has_velocity] += magnitude_reward[stage2_mask & has_velocity]
             
-            # HUGE reward for NOT grasping (i.e., released)
-            released = ~is_grasping & has_lifted_once
-            reward[released] += 10.0  
+        # HUGE reward for NOT grasping (i.e., released)
+        released = ~is_grasping & has_lifted_once
+        reward[released] += 5.0  
 
-            # HUGE penalty for still grasping
-            still_grasping = is_grasping & has_lifted_once
-            reward[still_grasping] -= 10.0  
+        # HUGE penalty for still grasping
+        still_grasping = is_grasping & has_lifted_once
+        reward[still_grasping] -= 5.0  
 
 
         
