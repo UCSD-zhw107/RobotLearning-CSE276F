@@ -133,6 +133,7 @@ class TestTaskEnv(BaseEnv):
 
             # initialize agent position
             self._initialize_agent_position(b)
+            self.default_tcp_pose = self.agent.tcp.pose.p.clone()
             
             # randomize cube and goal position
             self._randomize_cube_position(b)
@@ -285,7 +286,7 @@ class TestTaskEnv(BaseEnv):
         stage3_mask = has_released
         if stage3_mask.any():
             static_reward = 1 - torch.tanh(
-                5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], axis=1)
+                5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], dim=1)
             )
             reward[stage3_mask] += static_reward[stage3_mask] * 10.0
 
