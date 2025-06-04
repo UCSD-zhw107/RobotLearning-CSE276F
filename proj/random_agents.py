@@ -13,7 +13,7 @@ import torch
 from transforms3d.euler import euler2quat
 from env_cfg import EnvConfig
 from mani_skill.utils.building import actors
-from env import ThrowCubePandasEnv
+#from env import ThrowCubePandasEnv
 from test_env import TestTaskEnv
 import mani_skill
 

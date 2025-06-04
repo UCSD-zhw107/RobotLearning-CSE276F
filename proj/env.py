@@ -17,8 +17,8 @@ from typing import Any, Dict
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
 
-@register_env("TestTask-v1", max_episode_steps=200, override=True)
-class TestTaskEnv(BaseEnv):
+@register_env("ThrowCubePandas-v1", max_episode_steps=200, override=True)
+class ThrowCubePandasEnv(BaseEnv):
 
     def __init__(self, *args, robot_uids="panda", **kwargs):
         self.env_cfg = EnvConfig()
