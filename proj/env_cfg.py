@@ -32,6 +32,7 @@ class EnvConfig:
 
     # lift height
     lift_height: float = 0.2
+    lift_target_radius: float = 0.025
 
 
 

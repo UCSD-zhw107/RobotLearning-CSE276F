@@ -59,6 +59,18 @@ class TestTaskEnv(BaseEnv):
         self.cube.set_mass(self.env_cfg.cube_mass)
 
 
+    def _build_lift_target(self):
+        # build a intermediate lift target
+        self.lift_target = actors.build_sphere(
+            self.scene,
+            radius=self.env_cfg.lift_target_radius,
+            color=[0, 1, 0, 1],
+            name="lift_target",
+            body_type="kinematic",
+            add_collision=False,
+            initial_pose=sapien.Pose(),
+        )
+
 
     def _build_target(self):
         # build a goal region
@@ -80,6 +92,8 @@ class TestTaskEnv(BaseEnv):
         self._build_cube()
         # build goal region
         self._build_target()
+        # build lift target
+        self._build_lift_target()
 
     def _randomize_cube_position(self, num_envs: int):
         # randomize cube position
@@ -108,6 +122,24 @@ class TestTaskEnv(BaseEnv):
             goal_pose = Pose.create_from_pq(p=xyz_goal,q=euler2quat(0, np.pi / 2, 0))
             self.goal_region.set_pose(goal_pose)
 
+    def _randomize_lift_target_position(self, num_envs: int):
+        # randomize lift target position
+        with torch.device(self.device):
+            # set lift target position right above cube
+            '''lift_target_pos = self.cube.pose.p.clone()
+            lift_target_pos[..., 2] = self.env_cfg.table_height + self.env_cfg.lift_height'''
+
+            # sample cube position
+            xyz = torch.zeros((num_envs, 3))
+            xyz[..., 0] = (torch.rand((num_envs)) * 2 - 1) * 0.3 - 0.1
+            xyz[..., 1] = torch.rand((num_envs)) * 0.2 + 0.5
+            xyz[..., 2] = self.env_cfg.table_height + self.env_cfg.lift_height
+        
+            lift_target_pose = Pose.create_from_pq(p=xyz, q=np.array([1, 0, 0, 0]))
+            self.lift_target.set_pose(lift_target_pose)
+
+
+
     def _initialize_agent_position(self, num_envs: int):
         # initialize agent position
         with torch.device(self.device):
@@ -132,7 +164,7 @@ class TestTaskEnv(BaseEnv):
             # randomize cube and goal position
             self._randomize_cube_position(b)
             self._randomize_goal_position(b)
-            
+            self._randomize_lift_target_position(b)
 
 
     def evaluate(self) -> dict:
@@ -149,7 +181,13 @@ class TestTaskEnv(BaseEnv):
         cube_height = cube_pos[..., 2]
         has_landed = cube_height <= table_height + self.env_cfg.cube_halfsize
 
-        success = self.agent.is_grasping(self.cube) & (cube_height >= table_height + self.env_cfg.lift_height)
+
+        # check if cube is lifted to lift target
+        is_cube_lifted = (
+            torch.linalg.norm(self.lift_target.pose.p - self.cube.pose.p, dim=1) 
+            <= self.env_cfg.lift_target_radius
+        )
+        success = self.agent.is_grasping(self.cube) & is_cube_lifted
 
         fail = cube_height < 0.0
 
@@ -168,9 +206,13 @@ class TestTaskEnv(BaseEnv):
         
         if "state" in self._obs_mode:
             obs.update(
-                obj_pose=self.cube.pose.raw_pose,
-                tcp_to_obj_pos=self.cube.pose.p - self.agent.tcp_pose.p,
-                obj_to_goal_pos=self.goal_region.pose.p - self.cube.pose.p,
+                cube_pose=self.cube.pose.raw_pose,
+                #goal_pos=self.goal_region.pose.p,
+                lift_target_pos=self.lift_target.pose.p,
+                cube_velocity=self.cube.linear_velocity,
+                tcp_to_cube_pos=self.cube.pose.p - self.agent.tcp_pose.p,
+                #cube_to_goal_pos=self.goal_region.pose.p - self.cube.pose.p,
+                cube_to_lift_target_pos=self.lift_target.pose.p - self.cube.pose.p,
             )
         
         return obs
@@ -193,10 +235,8 @@ class TestTaskEnv(BaseEnv):
         reward += grasping_reward
 
         # stage 2: Lift cube
-        lift_pose = cube_pos.clone()
-        lift_pose[..., 2] = self.env_cfg.table_height + self.env_cfg.lift_height
-        cube_to_list_pose = torch.linalg.norm(lift_pose - cube_pos, dim=1)
-        lift_reward = 1 - torch.tanh(5.0 * cube_to_list_pose)
+        cube_to_lift_target_pose = torch.linalg.norm(self.lift_target.pose.p - cube_pos, dim=1)
+        lift_reward = 1 - torch.tanh(5.0 * cube_to_lift_target_pose)
         reward += lift_reward * is_grasping
 
         # success
