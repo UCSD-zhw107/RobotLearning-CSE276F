@@ -198,10 +198,11 @@ class TestTaskEnv(BaseEnv):
                 cube_pose=self.cube.pose.raw_pose,
                 goal_pos=self.goal_region.pose.p,
                 cube_velocity=self.cube.linear_velocity,
+                tcp_velocity=self.agent.tcp.get_linear_velocity(),
                 tcp_to_cube_pos=self.cube.pose.p - self.agent.tcp_pose.p,
                 cube_to_goal_pos=self.goal_region.pose.p - self.cube.pose.p,
                 has_lifted_once=info.get("has_lifted_once", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)),
-                #has_released=info.get("has_released", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)),
+                has_released=info.get("has_released", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)),
             )
         
         return obs
@@ -267,12 +268,49 @@ class TestTaskEnv(BaseEnv):
         # Stage 2: Release and throw (after lifted once)
         stage2_mask = has_lifted_once & ~has_released
         if stage2_mask.any():
-            direction_reward, magnitude_reward, velocity_magnitude = self._compute_velocity_reward(cube_velocity, goal_pos, cube_pos)
+
+            # get cube velocity# 1. PENALIZE TCP getting too close to goal (prevent extending)
+            tcp_to_goal_xy_dist = torch.linalg.norm(goal_pos[:, :2] - tcp_pos[:, :2], dim=1)
+            min_throwing_distance = 0.3  # Minimum distance to maintain from goal
+            too_close_penalty = torch.exp(-tcp_to_goal_xy_dist / min_throwing_distance) * 20.0
+
+
+            # Calculate optimal release conditions
+            cube_to_goal_xy = goal_pos[:, :2] - cube_pos[:, :2]
+            distance_to_goal_xy = torch.linalg.norm(cube_to_goal_xy, dim=1)
             
-            # Apply velocity rewards
-            has_velocity = velocity_magnitude > 0.01
-            reward[stage2_mask & has_velocity] += direction_reward[stage2_mask & has_velocity]
-            reward[stage2_mask & has_velocity] += magnitude_reward[stage2_mask & has_velocity]
+            # TCP velocity for momentum transfer
+            self.agent.tcp.get_angular_velocity()
+            tcp_velocity = self.agent.tcp.get_linear_velocity()
+            tcp_velocity_xy = tcp_velocity[:, :2]
+            
+            # Direction alignment between TCP velocity and cube-to-goal
+            tcp_vel_magnitude = torch.linalg.norm(tcp_velocity_xy, dim=1)
+            tcp_vel_direction = tcp_velocity_xy / (tcp_vel_magnitude.unsqueeze(-1) + 1e-6)
+            goal_direction = cube_to_goal_xy / (distance_to_goal_xy.unsqueeze(-1) + 1e-6)
+            
+            # Reward for TCP moving in the right direction before release
+            tcp_alignment = (tcp_vel_direction * goal_direction).sum(dim=1)
+            tcp_direction_reward = torch.clamp(tcp_alignment, 0, 1) * 15.0
+            
+            # Reward for TCP velocity magnitude (for momentum transfer)
+            tcp_speed_reward = torch.tanh(tcp_vel_magnitude * 0.5) * 10.0
+            
+            # Height-based release timing reward
+            optimal_release_height = self.env_cfg.table_height + self.env_cfg.lift_height * 0.8
+            height_difference = torch.abs(cube_pos[:, 2] - optimal_release_height)
+            height_timing_reward = torch.exp(-height_difference * 2.0) * 5.0
+            
+            # Apply rewards to grasping agents
+            grasping_mask = stage2_mask & is_grasping
+            reward[grasping_mask] += (
+                tcp_direction_reward[grasping_mask] + 
+                tcp_speed_reward[grasping_mask] + 
+                height_timing_reward[grasping_mask] - too_close_penalty[grasping_mask]
+            )
+            
+            # Penalize slow movement when grasping
+            reward[grasping_mask] -= torch.exp(-tcp_vel_magnitude[grasping_mask]) * 2.0
             
         # reward for NOT grasping (i.e., released)
         released = ~is_grasping & has_lifted_once
