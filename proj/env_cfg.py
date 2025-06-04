@@ -30,6 +30,9 @@ class EnvConfig:
     throw_vel_xy_threshold: float = 0.5
     throw_vel_threshold: float = 2.0
 
+    # lift height
+    lift_height: float = 0.2
+
 
 
 @dataclass
@@ -45,7 +48,3 @@ class RewardConfig:
     # penalty config
     drop_penalty_weight: float = -2.0
     action_penalty_weight: float = -0.01
-
-
-    # reward config
-    target_lift_height: float = 0.1
