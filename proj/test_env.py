@@ -226,7 +226,7 @@ class TestTaskEnv(BaseEnv):
         # Velocity magnitude reward
         magnitude_reward = torch.tanh(velocity_magnitude) * 10.0
 
-        return direction_reward, magnitude_reward
+        return direction_reward, magnitude_reward, velocity_magnitude
 
 
     def compute_dense_reward(self, obs: Any, action: Array, info: Dict):
@@ -266,43 +266,33 @@ class TestTaskEnv(BaseEnv):
         # Stage 2: Release and throw (after lifted once)
         stage2_mask = has_lifted_once & ~has_released
         if stage2_mask.any():
-            # Compute velocity direction toward goal
-            cube_to_goal = goal_pos - cube_pos
-            cube_to_goal_xy = cube_to_goal.clone()
-            cube_to_goal_xy[:, 2] = 0  # Only XY direction
-            cube_to_goal_dist = torch.linalg.norm(cube_to_goal_xy, dim=1)
-            cube_to_goal_dir = cube_to_goal_xy / (cube_to_goal_dist.unsqueeze(-1) + 1e-6)
-            
-            # Get velocity
-            velocity_xy = cube_velocity[:, :2]
-            velocity_magnitude = torch.linalg.norm(velocity_xy, dim=1)
-            
-            # Velocity direction alignment
-            velocity_dir = velocity_xy / (velocity_magnitude.unsqueeze(-1) + 1e-6)
-            direction_alignment = (cube_to_goal_dir[:, :2] * velocity_dir).sum(dim=1)
-            direction_reward = torch.clamp(direction_alignment, -1, 1) * 10.0  # -5 to +5
-            
-            # Velocity magnitude reward
-            magnitude_reward = torch.tanh(velocity_magnitude) * 10.0  # 0 to 3
+            direction_reward, magnitude_reward, velocity_magnitude = self._compute_velocity_reward(cube_velocity, goal_pos, cube_pos)
             
             # Apply velocity rewards
             has_velocity = velocity_magnitude > 0.01
             reward[stage2_mask & has_velocity] += direction_reward[stage2_mask & has_velocity]
             reward[stage2_mask & has_velocity] += magnitude_reward[stage2_mask & has_velocity]
             
-        # HUGE reward for NOT grasping (i.e., released)
+        # reward for NOT grasping (i.e., released)
         released = ~is_grasping & has_lifted_once
         reward[released] += 5.0  
 
-        # HUGE penalty for still grasping
+        # penalty for still grasping
         still_grasping = is_grasping & has_lifted_once
         reward[still_grasping] -= 5.0  
 
+        # Stage 3: After release
+        stage3_mask = has_released
+        if stage3_mask.any():
+            static_reward = 1 - torch.tanh(
+                5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], axis=1)
+            )
+            reward[stage3_mask] += static_reward[stage3_mask] * 10.0
 
         
         # success
         if "success" in info:
-            reward[info["success"]] += 10.0
+            reward[info["success"]] += 50.0
 
         # far penalty
         return reward
