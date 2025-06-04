@@ -59,18 +59,6 @@ class TestTaskEnv(BaseEnv):
         self.cube.set_mass(self.env_cfg.cube_mass)
 
 
-    def _build_lift_target(self):
-        # build a intermediate lift target
-        self.lift_target = actors.build_sphere(
-            self.scene,
-            radius=self.env_cfg.lift_target_radius,
-            color=[0, 1, 0, 1],
-            name="lift_target",
-            body_type="kinematic",
-            add_collision=False,
-            initial_pose=sapien.Pose(),
-        )
-
 
     def _build_target(self):
         # build a goal region
@@ -92,8 +80,8 @@ class TestTaskEnv(BaseEnv):
         self._build_cube()
         # build goal region
         self._build_target()
-        # build lift target
-        self._build_lift_target()
+        
+
 
     def _randomize_cube_position(self, num_envs: int):
         # randomize cube position
@@ -122,21 +110,6 @@ class TestTaskEnv(BaseEnv):
             goal_pose = Pose.create_from_pq(p=xyz_goal,q=euler2quat(0, np.pi / 2, 0))
             self.goal_region.set_pose(goal_pose)
 
-    def _randomize_lift_target_position(self, num_envs: int):
-        # randomize lift target position
-        with torch.device(self.device):
-            # set lift target position right above cube
-            '''lift_target_pos = self.cube.pose.p.clone()
-            lift_target_pos[..., 2] = self.env_cfg.table_height + self.env_cfg.lift_height'''
-
-            # sample cube position
-            xyz = torch.zeros((num_envs, 3))
-            xyz[..., 0] = (torch.rand((num_envs)) * 2 - 1) * 0.3 - 0.1
-            xyz[..., 1] = torch.rand((num_envs)) * 0.2 + 0.5
-            xyz[..., 2] = self.env_cfg.table_height + self.env_cfg.lift_height
-        
-            lift_target_pose = Pose.create_from_pq(p=xyz, q=np.array([1, 0, 0, 0]))
-            self.lift_target.set_pose(lift_target_pose)
 
 
 
@@ -164,7 +137,10 @@ class TestTaskEnv(BaseEnv):
             # randomize cube and goal position
             self._randomize_cube_position(b)
             self._randomize_goal_position(b)
-            self._randomize_lift_target_position(b)
+
+            if not hasattr(self, 'has_lifted_once'):
+                self.has_lifted_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self.has_lifted_once[env_idx] = False
 
 
     def evaluate(self) -> dict:
@@ -183,11 +159,14 @@ class TestTaskEnv(BaseEnv):
 
 
         # check if cube is lifted to lift target
-        is_cube_lifted = (
-            torch.linalg.norm(self.lift_target.pose.p - self.cube.pose.p, dim=1) 
-            <= self.env_cfg.lift_target_radius
-        )
-        success = self.agent.is_grasping(self.cube) & is_cube_lifted
+        is_cube_lifted = cube_height >= self.env_cfg.table_height + self.env_cfg.lift_height
+        reach_lift_target = self.agent.is_grasping(self.cube) & is_cube_lifted
+
+        # check if cube has lifted once
+        self.has_lifted_once = self.has_lifted_once | (reach_lift_target)
+
+        success = has_landed & in_goal_region & self.has_lifted_once
+
 
         fail = cube_height < 0.0
 
@@ -198,6 +177,8 @@ class TestTaskEnv(BaseEnv):
             "has_landed": has_landed,
             "cube_height": cube_height,
             "fail": fail,
+            "has_lifted_once": self.has_lifted_once,
+            "reach_lift_target": reach_lift_target,
         }
     
 
@@ -207,12 +188,11 @@ class TestTaskEnv(BaseEnv):
         if "state" in self._obs_mode:
             obs.update(
                 cube_pose=self.cube.pose.raw_pose,
-                #goal_pos=self.goal_region.pose.p,
-                lift_target_pos=self.lift_target.pose.p,
+                goal_pos=self.goal_region.pose.p,
                 cube_velocity=self.cube.linear_velocity,
                 tcp_to_cube_pos=self.cube.pose.p - self.agent.tcp_pose.p,
-                #cube_to_goal_pos=self.goal_region.pose.p - self.cube.pose.p,
-                cube_to_lift_target_pos=self.lift_target.pose.p - self.cube.pose.p,
+                cube_to_goal_pos=self.goal_region.pose.p - self.cube.pose.p,
+                has_lifted_once=info.get("has_lifted_once", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)),
             )
         
         return obs
@@ -222,26 +202,78 @@ class TestTaskEnv(BaseEnv):
         
         is_grasping = self.agent.is_grasping(self.cube)
         reward = torch.zeros(is_grasping.shape[0], device=self.device)
-
         tcp_pos = self.agent.tcp.pose.p
         cube_pos = self.cube.pose.p
         goal_pos = self.goal_region.pose.p
+        cube_velocity = self.cube.linear_velocity
         
+        # Get evaluation info
+        has_lifted_once = info.get("has_lifted_once", torch.zeros_like(is_grasping, dtype=torch.bool))
+    
         # stage 1: Reach and grasp cube
-        tcp_to_cube_dist = torch.linalg.norm(cube_pos - tcp_pos, dim=1)
-        reaching_reward = (1 - torch.tanh(5.0 * tcp_to_cube_dist))
-        grasping_reward = is_grasping
-        reward = reaching_reward 
-        reward += grasping_reward
+        stage1_mask = ~has_lifted_once
+        if stage1_mask.any():
+            tcp_to_cube_dist = torch.linalg.norm(cube_pos - tcp_pos, dim=1)
+            reaching_reward = (1 - torch.tanh(5.0 * tcp_to_cube_dist))
+            grasping_reward = is_grasping
+            
 
-        # stage 2: Lift cube
-        cube_to_lift_target_pose = torch.linalg.norm(self.lift_target.pose.p - cube_pos, dim=1)
-        lift_reward = 1 - torch.tanh(5.0 * cube_to_lift_target_pose)
-        reward += lift_reward * is_grasping
+            # lift cube
+            cube_height = cube_pos[..., 2]
+            lift_progress = torch.clamp(
+                (cube_height - self.env_cfg.table_height - self.env_cfg.cube_halfsize) / self.env_cfg.lift_height,
+                0, 1
+            )
+            lifting_reward = lift_progress * is_grasping.float() * 2.0
+            reward[stage1_mask] = (
+                reaching_reward[stage1_mask] + 
+                grasping_reward[stage1_mask] + 
+                lifting_reward[stage1_mask]
+            )
+            if "reach_lift_target" in info:
+                reward[info["reach_lift_target"]] += 5
+
+        # stage 3: Throw cube
+        stage3_mask = has_lifted_once
+        if stage3_mask.any():
+            # Compute ideal throwing direction (from cube to goal)
+            cube_to_goal = goal_pos - cube_pos
+            cube_to_goal_xy = cube_to_goal.clone()
+            cube_to_goal_xy[:, 2] = 0  # Only consider XY direction
+            
+            # Normalize direction
+            cube_to_goal_dir = cube_to_goal_xy / (torch.linalg.norm(cube_to_goal_xy, dim=1, keepdim=True) + 1e-6)
+            
+            # Velocity magnitude reward
+            velocity_magnitude = torch.linalg.norm(cube_velocity[:, :2], dim=1)  # XY velocity
+            velocity_reward = torch.tanh(velocity_magnitude / 2.0)  # Encourage velocity
+            
+            # Velocity direction reward (dot product with ideal direction)
+            velocity_xy = cube_velocity[:, :2]
+            velocity_dir = velocity_xy / (torch.linalg.norm(velocity_xy, dim=1, keepdim=True) + 1e-6)
+            direction_alignment = (cube_to_goal_dir[:, :2] * velocity_dir).sum(dim=1)
+            direction_reward = torch.clamp(direction_alignment, 0, 1)
+            
+            # Combined throwing reward
+            throwing_reward = velocity_reward * direction_reward * 3.0
+            
+            # Distance to goal reward (for trajectory)
+            distance_to_goal = torch.linalg.norm(cube_pos[:, :2] - goal_pos[:, :2], dim=1)
+            trajectory_reward = (1 - torch.tanh(2.0 * distance_to_goal))
+
+            reward[stage3_mask] = (
+                throwing_reward[stage3_mask] + 
+                trajectory_reward[stage3_mask]  
+            )
+
+            # release bonus
+            has_released = ~is_grasping & has_lifted_once
+            reward[has_released] += 1.0
+
 
         # success
         if "success" in info:
-            reward[info["success"]] += 5
+            reward[info["success"]] += 10.0
 
         # far penalty
         return reward
@@ -249,5 +281,5 @@ class TestTaskEnv(BaseEnv):
     
 
     def compute_normalized_dense_reward(self, obs: Any, action: Array, info: Dict):
-        max_reward = 5.0 # Maximum reward from success reward
+        max_reward = 10.0 # Maximum reward from success reward
         return self.compute_dense_reward(obs=obs, action=action, info=info) / max_reward
