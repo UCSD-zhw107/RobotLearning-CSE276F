@@ -140,8 +140,11 @@ class TestTaskEnv(BaseEnv):
 
             if not hasattr(self, 'has_lifted_once'):
                 self.has_lifted_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            self.has_lifted_once[env_idx] = False
+            if not hasattr(self, 'has_released'):
+                self.has_released = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+            self.has_lifted_once[env_idx] = False
+            self.has_released[env_idx] = False
 
     def evaluate(self) -> dict:
         # get cube and goalposition
@@ -165,6 +168,10 @@ class TestTaskEnv(BaseEnv):
         # check if cube has lifted once
         self.has_lifted_once = self.has_lifted_once | (reach_lift_target)
 
+        # check if cube is released
+        just_released = ~self.agent.is_grasping(self.cube) & self.has_lifted_once & ~self.has_released
+        self.has_released = self.has_released | just_released
+
         success = has_landed & in_goal_region & self.has_lifted_once
 
 
@@ -178,7 +185,7 @@ class TestTaskEnv(BaseEnv):
             "cube_height": cube_height,
             "fail": fail,
             "has_lifted_once": self.has_lifted_once,
-            "reach_lift_target": reach_lift_target,
+            "has_released": self.has_released,
         }
     
 
@@ -193,6 +200,7 @@ class TestTaskEnv(BaseEnv):
                 tcp_to_cube_pos=self.cube.pose.p - self.agent.tcp_pose.p,
                 cube_to_goal_pos=self.goal_region.pose.p - self.cube.pose.p,
                 has_lifted_once=info.get("has_lifted_once", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)),
+                #has_released=info.get("has_released", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)),
             )
         
         return obs
@@ -209,6 +217,7 @@ class TestTaskEnv(BaseEnv):
         
         # Get evaluation info
         has_lifted_once = info.get("has_lifted_once", torch.zeros_like(is_grasping, dtype=torch.bool))
+        has_released = info.get("has_released", torch.zeros_like(is_grasping, dtype=torch.bool))
     
         # stage 1: Reach and grasp cube
         stage1_mask = ~has_lifted_once
@@ -230,47 +239,21 @@ class TestTaskEnv(BaseEnv):
                 grasping_reward[stage1_mask] + 
                 lifting_reward[stage1_mask]
             )
-            if "reach_lift_target" in info:
-                reward[info["reach_lift_target"]] += 5
 
-        # stage 3: Throw cube
-        stage3_mask = has_lifted_once
-        if stage3_mask.any():
-            # Compute ideal throwing direction (from cube to goal)
-            cube_to_goal = goal_pos - cube_pos
-            cube_to_goal_xy = cube_to_goal.clone()
-            cube_to_goal_xy[:, 2] = 0  # Only consider XY direction
-            
-            # Normalize direction
-            cube_to_goal_dir = cube_to_goal_xy / (torch.linalg.norm(cube_to_goal_xy, dim=1, keepdim=True) + 1e-6)
-            
-            # Velocity magnitude reward
-            velocity_magnitude = torch.linalg.norm(cube_velocity[:, :2], dim=1)  # XY velocity
-            velocity_reward = torch.tanh(velocity_magnitude / 2.0)  # Encourage velocity
-            
-            # Velocity direction reward (dot product with ideal direction)
-            velocity_xy = cube_velocity[:, :2]
-            velocity_dir = velocity_xy / (torch.linalg.norm(velocity_xy, dim=1, keepdim=True) + 1e-6)
-            direction_alignment = (cube_to_goal_dir[:, :2] * velocity_dir).sum(dim=1)
-            direction_reward = torch.clamp(direction_alignment, 0, 1)
-            
-            # Combined throwing reward
-            throwing_reward = velocity_reward * direction_reward * 3.0
-            
-            # Distance to goal reward (for trajectory)
-            distance_to_goal = torch.linalg.norm(cube_pos[:, :2] - goal_pos[:, :2], dim=1)
-            trajectory_reward = (1 - torch.tanh(2.0 * distance_to_goal))
+        # Stage 2: Release and throw (after lifted once)
+        stage2_mask = has_lifted_once
+        if stage2_mask.any():
+            print(f'Number of has_lifted_once: {has_lifted_once.sum()}')
+            # HUGE reward for NOT grasping (i.e., released)
+            released = ~is_grasping & has_lifted_once
+            reward[released] += 10.0  
 
-            reward[stage3_mask] = (
-                throwing_reward[stage3_mask] + 
-                trajectory_reward[stage3_mask]  
-            )
-
-            # release bonus
-            has_released = ~is_grasping & has_lifted_once
-            reward[has_released] += 1.0
+            # HUGE penalty for still grasping
+            still_grasping = is_grasping & has_lifted_once
+            reward[still_grasping] -= 10.0  
 
 
+        
         # success
         if "success" in info:
             reward[info["success"]] += 10.0
