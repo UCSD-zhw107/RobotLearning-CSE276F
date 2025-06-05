@@ -186,7 +186,7 @@ class TestTaskEnv(BaseEnv):
         
         
         #wall_height = self.env_cfg.bin_wall_halfsize[2] 
-        wall_height = 0.0
+        wall_height = 0.03
         wall_thickness = self.env_cfg.bin_wall_halfsize[1]  
         
         
@@ -257,7 +257,9 @@ class TestTaskEnv(BaseEnv):
                 cube_pose=self.cube.pose.raw_pose,
                 bin_pose=self.bin.pose.raw_pose,
                 goal_pos=self.goal_region.pose.p,
-                tcp_to_bin_pos=self.bin.pose.p - self.agent.tcp_pose.p,
+                grasp_point=self.grasp_point,
+                tcp_to_grasp=self.grasp_point - self.agent.tcp.pose.p,
+                tcp_to_bin_pos=self.bin.pose.p - self.agent.tcp.pose.p,
                 bin_to_goal_pos=self.goal_region.pose.p - self.bin.pose.p,
                 cube_to_bin_pos=self.bin.pose.p - self.cube.pose.p,
             )
@@ -284,7 +286,7 @@ class TestTaskEnv(BaseEnv):
         ungrasp_reward = (
             torch.sum(self.agent.robot.get_qpos()[:, -2:], axis=1) / gripper_width
         )
-        reaching_reward = reaching_reward * ungrasp_reward
+        reaching_reward = reaching_reward * 0.5
         grasping_reward = is_grasping * 3.0
 
         # Cube in Bin reward
