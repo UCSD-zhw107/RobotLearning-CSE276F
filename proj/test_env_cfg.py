@@ -26,7 +26,7 @@ class TestEnvConfig:
     
 
     # bin confg
-    bin_wall_halfsize: Sequence[float] = (0.08, 0.008, 0.03)
+    bin_wall_halfsize: Sequence[float] = (0.08, 0.008, 0.02)
     bin_bottom_halfsize: Sequence[float] = (0.08, 0.08, 0.008)
     grasp_point_radius: float = 0.01
     

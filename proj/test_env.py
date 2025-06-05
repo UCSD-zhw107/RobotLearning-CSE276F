@@ -177,27 +177,28 @@ class TestTaskEnv(BaseEnv):
             self._randomize_cube_bin_position(b)
             self._randomize_goal_position(b)
 
-            self.grasp_points = self._get_bin_grasp_points()
 
 
-    def _get_bin_grasp_points(self):
+    def _get_bin_grasp_points(self) -> torch.Tensor:
         
         bin_pose = self.bin.pose
         bin_pos = bin_pose.p
         
         
-        wall_height = self.env_cfg.bin_wall_halfsize[2]  
+        #wall_height = self.env_cfg.bin_wall_halfsize[2] 
+        wall_height = 0.0
         wall_thickness = self.env_cfg.bin_wall_halfsize[1]  
         
         
         grasp_points = {
-            'front': bin_pos + torch.tensor([0, self.env_cfg.bin_bottom_halfsize[1] + wall_thickness, wall_height]),
-            'back': bin_pos + torch.tensor([0, -(self.env_cfg.bin_bottom_halfsize[1] + wall_thickness), wall_height]),
-            'right': bin_pos + torch.tensor([self.env_cfg.bin_bottom_halfsize[0] + wall_thickness, 0, wall_height]),
-            'left': bin_pos + torch.tensor([-(self.env_cfg.bin_bottom_halfsize[0] + wall_thickness), 0, wall_height])
+            'front': bin_pos[..., :] + torch.tensor([0, -self.env_cfg.bin_bottom_halfsize[1], wall_height], device=bin_pos.device),
+            'back': bin_pos[..., :] + torch.tensor([0, self.env_cfg.bin_bottom_halfsize[1], wall_height], device=bin_pos.device),
+            'right': bin_pos[..., :] + torch.tensor([-self.env_cfg.bin_bottom_halfsize[0] , 0, wall_height], device=bin_pos.device),
+            'left': bin_pos[..., :] + torch.tensor([self.env_cfg.bin_bottom_halfsize[0], 0, wall_height], device=bin_pos.device)
         }
-    
-        return grasp_points
+
+        # use front wall grasp point as default
+        return grasp_points['left']
 
 
     def _is_cube_in_bin(self):
@@ -232,13 +233,19 @@ class TestTaskEnv(BaseEnv):
         # check if bin on table
         is_bin_on_table = bin_pos[..., 2] <= self.env_cfg.table_height + self.env_cfg.bin_wall_halfsize[2] + 1e-3
 
+        # get grasp points
+        self.grasp_point = self._get_bin_grasp_points()
+        
+
         success = is_cube_in_bin & is_bin_in_goal_region & is_bin_on_table
+
 
         return {
             "success": success,
             "bin_in_goal_region": is_bin_in_goal_region,
             "cube_in_bin": is_cube_in_bin,
             "bin_on_table": is_bin_on_table,
+            "is_grasping": is_grasping,
         }
     
 
@@ -259,8 +266,41 @@ class TestTaskEnv(BaseEnv):
 
 
     def compute_dense_reward(self, obs: Any, action: Array, info: Dict):
+
+        # basic info
+        bin_pos = self.bin.pose.p
+        goal_pos = self.goal_region.pose.p
+        tcp_pos = self.agent.tcp.pose.p
+        grasp_point = self.grasp_point
+        is_grasping = self.agent.is_grasping(self.bin)
+        reward = torch.zeros(self.num_envs, device=self.device)
+        gripper_width = (self.agent.robot.get_qlimits()[0, -1, 1] * 2).to(
+            self.device
+        )
+
+        # Reaching and grasping reward
+        tcp_to_grasp_dist = torch.linalg.norm(grasp_point - tcp_pos, dim=1)
+        reaching_reward = (1 - torch.tanh(5.0 * tcp_to_grasp_dist))
+        ungrasp_reward = (
+            torch.sum(self.agent.robot.get_qpos()[:, -2:], axis=1) / gripper_width
+        )
+        reaching_reward = reaching_reward * ungrasp_reward
+        grasping_reward = is_grasping * 3.0
+
+        # Cube in Bin reward
+        cube_in_bin_reward = info['cube_in_bin'] * is_grasping
+
+        # Goal reaching reward
+        bin_to_goal_dist = torch.linalg.norm(goal_pos - bin_pos, dim=1)
+        goal_reaching_reward = (1 - torch.tanh(5.0 * bin_to_goal_dist)) * is_grasping
         
-        return 0
+        reward = reaching_reward + grasping_reward + cube_in_bin_reward + goal_reaching_reward
+
+        # check if success
+        if 'success' in info:
+            reward[info['success']]= 10.0
+        
+        return reward
     
 
     def compute_normalized_dense_reward(self, obs: Any, action: Array, info: Dict):
