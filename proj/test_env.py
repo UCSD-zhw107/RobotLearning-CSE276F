@@ -294,7 +294,7 @@ class TestTaskEnv(BaseEnv):
 
         # Goal reaching reward
         bin_to_goal_dist = torch.linalg.norm(goal_pos - bin_pos, dim=1)
-        goal_reaching_reward = (1 - torch.tanh(5.0 * bin_to_goal_dist)) * is_grasping
+        goal_reaching_reward = (1 - torch.tanh(5.0 * bin_to_goal_dist)) * 5.0 * is_grasping
         
         reward = reaching_reward + grasping_reward + cube_in_bin_reward + goal_reaching_reward
 
