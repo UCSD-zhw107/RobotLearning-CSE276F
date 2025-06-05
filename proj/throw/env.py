@@ -11,14 +11,14 @@ from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.wrappers.record import RecordEpisode
 import torch
 from transforms3d.euler import euler2quat
-from env_cfg import EnvConfig, RewardConfig
+from throw.env_cfg import EnvConfig, RewardConfig
 from mani_skill.utils.building import actors
 from typing import Any, Dict
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
 
-@register_env("TempTask-v1", max_episode_steps=200, override=True)
-class TempTaskEnv(BaseEnv):
+@register_env("ThrowCubePandas-v1", max_episode_steps=200, override=True)
+class ThrowCubePandasEnv(BaseEnv):
 
     def __init__(self, *args, robot_uids="panda", **kwargs):
         self.env_cfg = EnvConfig()
@@ -143,6 +143,7 @@ class TempTaskEnv(BaseEnv):
                 self.has_lifted_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             if not hasattr(self, 'has_released'):
                 self.has_released = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
             self.has_lifted_once[env_idx] = False
             self.has_released[env_idx] = False
 
@@ -186,7 +187,6 @@ class TempTaskEnv(BaseEnv):
             "fail": fail,
             "has_lifted_once": self.has_lifted_once,
             "has_released": self.has_released,
-            "just_released": just_released,
         }
     
 
@@ -208,34 +208,27 @@ class TempTaskEnv(BaseEnv):
         return obs
 
 
-    def _compute_velocity_reward(self, goal_pos: Array, cube_pos: Array):
-        # Calculate optimal release conditions
-        cube_to_goal_xy = goal_pos[:, :2] - cube_pos[:, :2]
-        distance_to_goal_xy = torch.linalg.norm(cube_to_goal_xy, dim=1)
+    def _compute_velocity_reward(self, cube_velocity: Array, goal_pos: Array, cube_pos: Array):
+        # Compute velocity direction toward goal
+        cube_to_goal = goal_pos - cube_pos
+        cube_to_goal_xy = cube_to_goal.clone()
+        cube_to_goal_xy[:, 2] = 0  # Only XY direction
+        cube_to_goal_dist = torch.linalg.norm(cube_to_goal_xy, dim=1)
+        cube_to_goal_dir = cube_to_goal_xy / (cube_to_goal_dist.unsqueeze(-1) + 1e-6)
         
-        # TCP velocity for momentum transfer
-        self.agent.tcp.get_angular_velocity()
-        tcp_velocity = self.agent.tcp.get_linear_velocity()
-        tcp_velocity_xy = tcp_velocity[:, :2]
+        # Get velocity
+        velocity_xy = cube_velocity[:, :2]
+        velocity_magnitude = torch.linalg.norm(velocity_xy, dim=1)
         
-        # Direction alignment between TCP velocity and cube-to-goal
-        tcp_vel_magnitude = torch.linalg.norm(tcp_velocity_xy, dim=1)
-        tcp_vel_direction = tcp_velocity_xy / (tcp_vel_magnitude.unsqueeze(-1) + 1e-6)
-        goal_direction = cube_to_goal_xy / (distance_to_goal_xy.unsqueeze(-1) + 1e-6)
+        # Velocity direction alignment
+        velocity_dir = velocity_xy / (velocity_magnitude.unsqueeze(-1) + 1e-6)
+        direction_alignment = (cube_to_goal_dir[:, :2] * velocity_dir).sum(dim=1)
+        direction_reward = torch.clamp(direction_alignment, -1, 1) * 10.0  # -5 to +5
         
-        # Reward for TCP moving in the right direction before release
-        tcp_alignment = (tcp_vel_direction * goal_direction).sum(dim=1)
-        tcp_direction_reward = torch.clamp(tcp_alignment, 0, 1) * 15.0
-        
-        # Reward for TCP velocity magnitude (for momentum transfer)
-        tcp_speed_reward = torch.tanh(tcp_vel_magnitude * 0.5) * 20.0
-        
-        # Height-based release timing reward
-        optimal_release_height = self.env_cfg.table_height + self.env_cfg.lift_height * 0.8
-        height_difference = torch.abs(cube_pos[:, 2] - optimal_release_height)
-        height_timing_reward = torch.exp(-height_difference * 2.0) * 5.0
+        # Velocity magnitude reward
+        magnitude_reward = torch.tanh(velocity_magnitude) * 10.0
 
-        return tcp_direction_reward, tcp_speed_reward, height_timing_reward
+        return direction_reward, magnitude_reward, velocity_magnitude
 
 
     def compute_dense_reward(self, obs: Any, action: Array, info: Dict):
@@ -318,13 +311,14 @@ class TempTaskEnv(BaseEnv):
             
             # Penalize slow movement when grasping
             reward[grasping_mask] -= torch.exp(-tcp_vel_magnitude[grasping_mask]) * 2.0
-
-            still_grasping_penalty = (1.0 + 5.0 * torch.exp(-(tcp_to_goal_xy_dist-0.2)*3)) * 8.0
-            reward[grasping_mask] -= still_grasping_penalty[grasping_mask]
-
-            just_released_mask = (~is_grasping) & has_lifted_once & (~info["has_released"])
-            reward[just_released_mask] += 20.0
             
+        # reward for NOT grasping (i.e., released)
+        released = ~is_grasping & has_lifted_once
+        reward[released] += 5.0  
+
+        # penalty for still grasping
+        still_grasping = is_grasping & has_lifted_once
+        reward[still_grasping] -= 5.0  
 
         # Stage 3: After release
         stage3_mask = has_released
@@ -333,12 +327,6 @@ class TempTaskEnv(BaseEnv):
                 5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], dim=1)
             )
             reward[stage3_mask] += static_reward[stage3_mask] * 10.0
-
-        # get cube velocity# 1. PENALIZE TCP getting too close to goal (prevent extending)
-        tcp_to_goal_xy_dist = torch.linalg.norm(goal_pos[:, :2] - tcp_pos[:, :2], dim=1)
-        min_throwing_distance = 0.3  # Minimum distance to maintain from goal
-        too_close_penalty = torch.exp(-tcp_to_goal_xy_dist / min_throwing_distance) * 20.0
-        reward[stage3_mask] -= too_close_penalty[stage3_mask]
 
         
         # success

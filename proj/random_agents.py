@@ -11,9 +11,6 @@ from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.wrappers.record import RecordEpisode
 import torch
 from transforms3d.euler import euler2quat
-from env_cfg import EnvConfig
-from mani_skill.utils.building import actors
-#from env import ThrowCubePandasEnv
 from test_env import TestTaskEnv
 import mani_skill
 
@@ -30,13 +27,13 @@ def main():
                 human_render_camera_configs=dict(shader_pack="default"),
                 obs_mode="state"
     )
-    env = RecordEpisode(env, output_dir="random_agents", video_fps=20, info_on_video=False)
+    env = RecordEpisode(env, output_dir="random_agents", video_fps=20, info_on_video=True)
     obs, info = env.reset(seed=42)
     print("Action space:", env.action_space)
     print("Observation space:", env.observation_space)
     for t in range(50):
-        zero_action = np.zeros(env.action_space.shape)
-        obs, reward, terminated, truncated, info = env.step(zero_action)
+        #zero_action = np.zeros(env.action_space.shape)
+        obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
     img = env.render().cpu().numpy()[0]
     print(f'Video saved to /random_agents')
     env.close()

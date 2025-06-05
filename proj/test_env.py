@@ -11,7 +11,7 @@ from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.wrappers.record import RecordEpisode
 import torch
 from transforms3d.euler import euler2quat
-from env_cfg import EnvConfig, RewardConfig
+from test_env_cfg import TestEnvConfig
 from mani_skill.utils.building import actors
 from typing import Any, Dict
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
@@ -21,8 +21,7 @@ from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 class TestTaskEnv(BaseEnv):
 
     def __init__(self, *args, robot_uids="panda", **kwargs):
-        self.env_cfg = EnvConfig()
-        self.reward_cfg = RewardConfig()
+        self.env_cfg = TestEnvConfig()
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
 
@@ -59,6 +58,40 @@ class TestTaskEnv(BaseEnv):
         self.cube.set_mass(self.env_cfg.cube_mass)
 
 
+    def _build_bin(self):
+        bin_builder = self.scene.create_actor_builder()
+        # bottom
+        bin_builder.add_box_collision(
+            half_size=self.env_cfg.bin_bottom_halfsize,
+            pose = sapien.Pose(p=[0,0, -self.env_cfg.bin_bottom_halfsize[2]], q=[1, 0, 0, 0]),
+        )
+        bin_builder.add_box_visual(
+            half_size=self.env_cfg.bin_bottom_halfsize,
+            pose = sapien.Pose(p=[0,0, -self.env_cfg.bin_bottom_halfsize[2]], q=[1, 0, 0, 0]),
+        )
+        # walls
+        wall_pose_offsets = [
+            [0, self.env_cfg.bin_bottom_halfsize[1] - self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],   # front
+            [0, -self.env_cfg.bin_bottom_halfsize[1] + self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],  # back
+            [self.env_cfg.bin_bottom_halfsize[0] - self.env_cfg.bin_wall_halfsize[1], 0, self.env_cfg.bin_wall_halfsize[2]],   # right
+            [-self.env_cfg.bin_bottom_halfsize[0] + self.env_cfg.bin_wall_halfsize[1], 0, self.env_cfg.bin_wall_halfsize[2]],  # left
+        ]
+        for i, offset in enumerate(wall_pose_offsets):
+            if i >= 2:  
+                quat = sapien.Pose(q=[np.cos(np.pi/4), 0, 0, np.sin(np.pi/4)]).q  
+            else:  
+                quat = [1, 0, 0, 0]  
+            bin_builder.add_box_collision(
+                half_size=self.env_cfg.bin_wall_halfsize,
+                pose=sapien.Pose(p=offset, q=quat)
+            )
+            bin_builder.add_box_visual(
+                half_size=self.env_cfg.bin_wall_halfsize,
+                pose=sapien.Pose(p=offset, q=quat),
+            )
+        bin_builder.initial_pose = sapien.Pose(p=[0.2, 0, 0.1], q=[1, 0, 0, 0])
+        self.bin = bin_builder.build_dynamic(name="bin")
+
 
     def _build_target(self):
         # build a goal region
@@ -80,19 +113,26 @@ class TestTaskEnv(BaseEnv):
         self._build_cube()
         # build goal region
         self._build_target()
+        # build bin
+        self._build_bin()
         
 
 
-    def _randomize_cube_position(self, num_envs: int):
+    def _randomize_cube_bin_position(self, num_envs: int):
         # randomize cube position
         with torch.device(self.device):
             # sample cube position
             xyz = torch.zeros((num_envs, 3))
             xyz[..., 0] = (torch.rand((num_envs)) * 2 - 1) * 0.3 - 0.1
             xyz[..., 1] = torch.rand((num_envs)) * 0.2 + 0.5
-            xyz[..., 2] = self.env_cfg.table_height + self.env_cfg.cube_halfsize
+            xyz[..., 2] = self.env_cfg.table_height + 0.05
         
-            cube_pose = Pose.create_from_pq(p=xyz, q=np.array([1, 0, 0, 0]))
+            bin_pose = Pose.create_from_pq(p=xyz, q=np.array([1, 0, 0, 0]))
+            self.bin.set_pose(bin_pose)
+
+            # get cube position
+            cube_xyz = xyz + torch.tensor([0, 0, 0.05])
+            cube_pose = Pose.create_from_pq(p=cube_xyz, q=np.array([1, 0, 0, 0]))
             self.cube.set_pose(cube_pose)
 
     def _randomize_goal_position(self, num_envs: int):
@@ -109,8 +149,6 @@ class TestTaskEnv(BaseEnv):
             # set goal position
             goal_pose = Pose.create_from_pq(p=xyz_goal,q=euler2quat(0, np.pi / 2, 0))
             self.goal_region.set_pose(goal_pose)
-
-
 
 
     def _initialize_agent_position(self, num_envs: int):
@@ -136,72 +174,71 @@ class TestTaskEnv(BaseEnv):
             self.default_tcp_pose = self.agent.tcp.pose.p.clone()
             
             # randomize cube and goal position
-            self._randomize_cube_position(b)
+            self._randomize_cube_bin_position(b)
             self._randomize_goal_position(b)
 
-            if not hasattr(self, 'has_lifted_once'):
-                self.has_lifted_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            if not hasattr(self, 'has_released'):
-                self.has_released = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            if not hasattr(self, 'grasp_step_counter'):
-                self.grasp_step_counter = torch.full((self.num_envs,), 0, device=self.device)
+            self.grasp_points = self._get_bin_grasp_points()
 
-            self.has_lifted_once[env_idx] = False
-            self.has_released[env_idx] = False
-            self.grasp_step_counter[env_idx] = 0
+
+    def _get_bin_grasp_points(self):
+        
+        bin_pose = self.bin.pose
+        bin_pos = bin_pose.p
+        
+        
+        wall_height = self.env_cfg.bin_wall_halfsize[2]  
+        wall_thickness = self.env_cfg.bin_wall_halfsize[1]  
+        
+        
+        grasp_points = {
+            'front': bin_pos + torch.tensor([0, self.env_cfg.bin_bottom_halfsize[1] + wall_thickness, wall_height]),
+            'back': bin_pos + torch.tensor([0, -(self.env_cfg.bin_bottom_halfsize[1] + wall_thickness), wall_height]),
+            'right': bin_pos + torch.tensor([self.env_cfg.bin_bottom_halfsize[0] + wall_thickness, 0, wall_height]),
+            'left': bin_pos + torch.tensor([-(self.env_cfg.bin_bottom_halfsize[0] + wall_thickness), 0, wall_height])
+        }
+    
+        return grasp_points
+
+
+    def _is_cube_in_bin(self):
+        cube_pose = self.cube.pose.p   # (b, 3)
+        bin_pose = self.bin.pose.p     # (b, 3)
+        bin_halfsize = torch.tensor(self.env_cfg.bin_bottom_halfsize, device=cube_pose.device)  # (3,)
+        lower_bound = bin_pose[..., :2] - bin_halfsize[:2]
+        upper_bound = bin_pose[..., :2] + bin_halfsize[:2]
+        inside_xy = (cube_pose[..., 0] >= lower_bound[..., 0]) & (cube_pose[..., 0] <= upper_bound[..., 0]) & \
+                    (cube_pose[..., 1] >= lower_bound[..., 1]) & (cube_pose[..., 1] <= upper_bound[..., 1])
+
+        expected_z = bin_pose[..., 2] + self.env_cfg.bin_bottom_halfsize[2] + self.env_cfg.cube_halfsize
+        z_close = torch.abs(cube_pose[..., 2] - expected_z) < 0.05
+        return inside_xy & z_close
+
+
 
     def evaluate(self) -> dict:
         # get cube and goalposition
         cube_pos = self.cube.pose.p
         goal_pos = self.goal_region.pose.p
-        is_grasping = self.agent.is_grasping(self.cube)
+        bin_pos = self.bin.pose.p
+        is_grasping = self.agent.is_grasping(self.bin)
 
-        # check if cube is in goal region
+        # check if cube in bin
+        is_cube_in_bin = self._is_cube_in_bin()
+        
+        # check if bin in goal region
         distance_xy_to_goal = torch.linalg.norm(cube_pos[..., :2] - goal_pos[..., :2], dim=1)
-        in_goal_region = distance_xy_to_goal < self.env_cfg.goal_radius
+        is_bin_in_goal_region = distance_xy_to_goal < self.env_cfg.goal_radius
 
-        # check if cube has landed
-        table_height = self.env_cfg.table_height
-        cube_height = cube_pos[..., 2]
-        has_landed = cube_height <= table_height + self.env_cfg.cube_halfsize
+        # check if bin on table
+        is_bin_on_table = bin_pos[..., 2] <= self.env_cfg.table_height + self.env_cfg.bin_wall_halfsize[2] + 1e-3
 
-
-        # check if cube is lifted to lift target
-        is_cube_lifted = cube_height >= self.env_cfg.table_height + self.env_cfg.lift_height
-        reach_lift_target = is_grasping & is_cube_lifted
-
-        # check if cube has lifted once
-        self.has_lifted_once = self.has_lifted_once | (reach_lift_target)
-
-        # check if cube is released
-        just_released = ~is_grasping & self.has_lifted_once & ~self.has_released
-        self.has_released = self.has_released | just_released
-
-        success = has_landed & in_goal_region & self.has_lifted_once
-
-        # update grasp step counter
-        currently_grasping_after_lift = is_grasping & self.has_lifted_once & ~self.has_released
-        self.grasp_step_counter[currently_grasping_after_lift] += 1
-        self.grasp_step_counter[~currently_grasping_after_lift] = 0
-        max_grasp_steps = self.env_cfg.max_grasp_time
-        grasp_timeout = (
-            self.has_lifted_once & 
-            is_grasping & 
-            (self.grasp_step_counter > max_grasp_steps)
-        )
-  
-        fail = grasp_timeout
+        success = is_cube_in_bin & is_bin_in_goal_region & is_bin_on_table
 
         return {
             "success": success,
-            "distance_xy_to_goal": distance_xy_to_goal,
-            "in_goal_region": in_goal_region,
-            "has_landed": has_landed,
-            "cube_height": cube_height,
-            "fail": fail,
-            "has_lifted_once": self.has_lifted_once,
-            "has_released": self.has_released,
-            "just_released": just_released,
+            "bin_in_goal_region": is_bin_in_goal_region,
+            "cube_in_bin": is_cube_in_bin,
+            "bin_on_table": is_bin_on_table,
         }
     
 
@@ -211,193 +248,19 @@ class TestTaskEnv(BaseEnv):
         if "state" in self._obs_mode:
             obs.update(
                 cube_pose=self.cube.pose.raw_pose,
+                bin_pose=self.bin.pose.raw_pose,
                 goal_pos=self.goal_region.pose.p,
-                cube_velocity=self.cube.linear_velocity,
-                tcp_velocity=self.agent.tcp.get_linear_velocity(),
-                tcp_to_cube_pos=self.cube.pose.p - self.agent.tcp_pose.p,
-                cube_to_goal_pos=self.goal_region.pose.p - self.cube.pose.p,
-                has_lifted_once=info.get("has_lifted_once", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)),
-                has_released=info.get("has_released", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)),
+                tcp_to_bin_pos=self.bin.pose.p - self.agent.tcp_pose.p,
+                bin_to_goal_pos=self.goal_region.pose.p - self.bin.pose.p,
+                cube_to_bin_pos=self.bin.pose.p - self.cube.pose.p,
             )
         
         return obs
 
 
-
-    def _compute_cube_velocity_reward(self, cube_velocity, goal_pos, cube_pos):
-        # Calculate optimal release conditions
-        cube_to_goal_xy = goal_pos[:, :2] - cube_pos[:, :2]
-        distance_to_goal_xy = torch.linalg.norm(cube_to_goal_xy, dim=1)
-        
-        # TCP velocity for momentum transfer
-        cube_velocity_xy = cube_velocity[:, :2]
-        cube_vel_magnitude = torch.linalg.norm(cube_velocity_xy, dim=1)
-        cube_vel_direction = cube_velocity_xy / (cube_vel_magnitude.unsqueeze(-1) + 1e-6)
-        goal_direction = cube_to_goal_xy / (distance_to_goal_xy.unsqueeze(-1) + 1e-6)
-        
-        # Reward for cube moving in the right direction before release
-        cube_alignment = (cube_vel_direction * goal_direction).sum(dim=1)
-        cube_direction_reward = torch.clamp(cube_alignment, 0, 1) * 15.0
-
-        # Reward for TCP velocity magnitude (for momentum transfer)
-        cube_speed_reward = torch.tanh(cube_vel_magnitude * 0.5) * 20.0
-        
-        return cube_direction_reward, cube_speed_reward
-
-
-    def _compute_tcp_velocity_reward(self, goal_pos: Array, cube_pos: Array):
-        # Calculate optimal release conditions
-        cube_to_goal_xy = goal_pos[:, :2] - cube_pos[:, :2]
-        distance_to_goal_xy = torch.linalg.norm(cube_to_goal_xy, dim=1)
-        
-        # TCP velocity for momentum transfer
-        self.agent.tcp.get_angular_velocity()
-        tcp_velocity = self.agent.tcp.get_linear_velocity()
-        tcp_velocity_xy = tcp_velocity[:, :2]
-        
-        # Direction alignment between TCP velocity and cube-to-goal
-        tcp_vel_magnitude = torch.linalg.norm(tcp_velocity_xy, dim=1)
-        tcp_vel_direction = tcp_velocity_xy / (tcp_vel_magnitude.unsqueeze(-1) + 1e-6)
-        goal_direction = cube_to_goal_xy / (distance_to_goal_xy.unsqueeze(-1) + 1e-6)
-        
-        # Reward for TCP moving in the right direction before release
-        tcp_alignment = (tcp_vel_direction * goal_direction).sum(dim=1)
-        tcp_direction_reward = torch.clamp(tcp_alignment, 0, 1) * 15.0
-        
-        # Reward for TCP velocity magnitude (for momentum transfer)
-        tcp_speed_reward = torch.tanh(tcp_vel_magnitude * 0.5) * 20.0
-        
-        # Height-based release timing reward
-        optimal_release_height = self.env_cfg.table_height + self.env_cfg.lift_height * 0.8
-        height_difference = torch.abs(cube_pos[:, 2] - optimal_release_height)
-        height_timing_reward = torch.exp(-height_difference * 2.0) * 5.0
-
-        return tcp_direction_reward, tcp_speed_reward, height_timing_reward
-
-
     def compute_dense_reward(self, obs: Any, action: Array, info: Dict):
         
-        is_grasping = self.agent.is_grasping(self.cube)
-        reward = torch.zeros(is_grasping.shape[0], device=self.device)
-        tcp_pos = self.agent.tcp.pose.p
-        cube_pos = self.cube.pose.p
-        goal_pos = self.goal_region.pose.p
-        cube_velocity = self.cube.linear_velocity
-        
-        # Get evaluation info
-        has_lifted_once = info.get("has_lifted_once", torch.zeros_like(is_grasping, dtype=torch.bool))
-        has_released = info.get("has_released", torch.zeros_like(is_grasping, dtype=torch.bool))
-    
-        # stage 1: Reach and grasp cube
-        stage1_mask = ~has_lifted_once & ~has_released
-        if stage1_mask.any():
-            tcp_to_cube_dist = torch.linalg.norm(cube_pos - tcp_pos, dim=1)
-            reaching_reward = (1 - torch.tanh(5.0 * tcp_to_cube_dist))
-            grasping_reward = is_grasping
-            
-
-            # lift cube
-            cube_height = cube_pos[..., 2]
-            lift_progress = torch.clamp(
-                (cube_height - self.env_cfg.table_height - self.env_cfg.cube_halfsize) / self.env_cfg.lift_height,
-                0, 1
-            )
-            lifting_reward = lift_progress * is_grasping.float() * 2.0
-            reward[stage1_mask] = (
-                reaching_reward[stage1_mask] + 
-                grasping_reward[stage1_mask] + 
-                lifting_reward[stage1_mask]
-            )
-
-        # Stage 2: Prepare for release
-        stage2_mask = has_lifted_once & ~has_released
-        if stage2_mask.any():
-
-            # get cube velocity# 1. PENALIZE TCP getting too close to goal (prevent extending)
-            tcp_to_goal_xy_dist = torch.linalg.norm(goal_pos[:, :2] - tcp_pos[:, :2], dim=1)
-            min_throwing_distance = 0.3  # Minimum distance to maintain from goal
-            too_close_penalty = torch.exp(-tcp_to_goal_xy_dist / min_throwing_distance) * 20.0
-
-
-            # Calculate optimal release conditions
-            cube_to_goal_xy = goal_pos[:, :2] - cube_pos[:, :2]
-            distance_to_goal_xy = torch.linalg.norm(cube_to_goal_xy, dim=1)
-            
-            # TCP velocity for momentum transfer
-            self.agent.tcp.get_angular_velocity()
-            tcp_velocity = self.agent.tcp.get_linear_velocity()
-            tcp_velocity_xy = tcp_velocity[:, :2]
-            
-            # Direction alignment between TCP velocity and cube-to-goal
-            tcp_vel_magnitude = torch.linalg.norm(tcp_velocity_xy, dim=1)
-            tcp_vel_direction = tcp_velocity_xy / (tcp_vel_magnitude.unsqueeze(-1) + 1e-6)
-            goal_direction = cube_to_goal_xy / (distance_to_goal_xy.unsqueeze(-1) + 1e-6)
-            
-            # Reward for TCP moving in the right direction before release
-            tcp_alignment = (tcp_vel_direction * goal_direction).sum(dim=1)
-            tcp_direction_reward = torch.clamp(tcp_alignment, 0, 1) * 15.0
-            
-            # Reward for TCP velocity magnitude (for momentum transfer)
-            tcp_speed_reward = torch.tanh(tcp_vel_magnitude * 0.5) * 20.0
-            
-            # Height-based release timing reward
-            optimal_release_height = self.env_cfg.table_height + self.env_cfg.lift_height * 0.5
-            height_difference = torch.abs(cube_pos[:, 2] - optimal_release_height)
-            height_timing_reward = torch.exp(-height_difference * 2.0) * 5.0
-
-            # joint vel reward
-            joint_vel = self.agent.robot.get_qvel()[..., :-2]
-            joint_vel_magnitude = torch.linalg.norm(joint_vel, dim=1)
-            joint_vel_reward = torch.tanh(joint_vel_magnitude * 0.5) * 10.0
-            
-            # Apply rewards to grasping agents
-            grasping_mask = stage2_mask & is_grasping
-            reward[grasping_mask] += (
-                tcp_direction_reward[grasping_mask] + 
-                tcp_speed_reward[grasping_mask] + 
-                height_timing_reward[grasping_mask] - too_close_penalty[grasping_mask] + joint_vel_reward[grasping_mask]
-            )
-            
-            # Penalize slow movement when grasping
-            reward[grasping_mask] -= torch.exp(-tcp_vel_magnitude[grasping_mask]) * 2.0
-
-        # Stage 3: Just Release
-        stage3_mask = info['just_released']
-        if stage3_mask.any():
-            cube_direction_reward, cube_speed_reward = self._compute_cube_velocity_reward(cube_velocity, goal_pos, cube_pos)
-            reward[stage3_mask] += cube_direction_reward[stage3_mask] + cube_speed_reward[stage3_mask]
-
-            # joint vel reward
-            joint_vel = self.agent.robot.get_qvel()[..., :-2]
-            joint_vel_magnitude = torch.linalg.norm(joint_vel, dim=1)
-            joint_vel_reward = torch.tanh(joint_vel_magnitude * 0.5) * 10.0
-
-            reward[stage3_mask] += joint_vel_reward[stage3_mask]
-
-            
-        # reward for NOT grasping (i.e., released)
-        released = ~is_grasping & has_lifted_once
-        reward[released] += 7.0  
-
-        # penalty for still grasping
-        still_grasping = is_grasping & has_lifted_once
-        reward[still_grasping] -= 7.0  
-
-        # Stage 3: After release
-        stage4_mask = has_released
-        if stage4_mask.any():
-            static_reward = 1 - torch.tanh(
-                5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], dim=1)
-            )
-            reward[stage4_mask] += static_reward[stage4_mask] * 10.0
-
-        
-        # success
-        if "success" in info:
-            reward[info["success"]] += 50.0
-
-        # far penalty
-        return reward
+        return 0
     
 
     def compute_normalized_dense_reward(self, obs: Any, action: Array, info: Dict):
