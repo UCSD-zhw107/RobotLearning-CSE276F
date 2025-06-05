@@ -16,7 +16,7 @@ class EnvConfig:
     
 
     # target config
-    goal_radius: float = 0.25
+    goal_radius: float = 0.15
     goal_distance: float = 0.5
     
 
@@ -29,6 +29,9 @@ class EnvConfig:
     throw_air_threshold: float = 0.1
     throw_vel_xy_threshold: float = 0.5
     throw_vel_threshold: float = 2.0
+
+    # grasp config
+    max_grasp_time: int = 40
 
     # lift height
     lift_height: float = 0.2

@@ -22,7 +22,7 @@ This script is used to test the demo agents with random actions.
 """
 
 def main():
-    env = gym.make("ThrowCubePandas-v1",
+    env = gym.make("TestTask-v1",
                 num_envs=1,
                 control_mode="pd_joint_delta_pos",
                 render_mode="rgb_array",
@@ -35,7 +35,8 @@ def main():
     print("Action space:", env.action_space)
     print("Observation space:", env.observation_space)
     for t in range(50):
-        obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+        zero_action = np.zeros(env.action_space.shape)
+        obs, reward, terminated, truncated, info = env.step(zero_action)
     img = env.render().cpu().numpy()[0]
     print(f'Video saved to /random_agents')
     env.close()

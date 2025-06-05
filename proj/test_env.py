@@ -143,13 +143,18 @@ class TestTaskEnv(BaseEnv):
                 self.has_lifted_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             if not hasattr(self, 'has_released'):
                 self.has_released = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            if not hasattr(self, 'grasp_step_counter'):
+                self.grasp_step_counter = torch.full((self.num_envs,), 0, device=self.device)
+
             self.has_lifted_once[env_idx] = False
             self.has_released[env_idx] = False
+            self.grasp_step_counter[env_idx] = 0
 
     def evaluate(self) -> dict:
         # get cube and goalposition
         cube_pos = self.cube.pose.p
         goal_pos = self.goal_region.pose.p
+        is_grasping = self.agent.is_grasping(self.cube)
 
         # check if cube is in goal region
         distance_xy_to_goal = torch.linalg.norm(cube_pos[..., :2] - goal_pos[..., :2], dim=1)
@@ -163,19 +168,29 @@ class TestTaskEnv(BaseEnv):
 
         # check if cube is lifted to lift target
         is_cube_lifted = cube_height >= self.env_cfg.table_height + self.env_cfg.lift_height
-        reach_lift_target = self.agent.is_grasping(self.cube) & is_cube_lifted
+        reach_lift_target = is_grasping & is_cube_lifted
 
         # check if cube has lifted once
         self.has_lifted_once = self.has_lifted_once | (reach_lift_target)
 
         # check if cube is released
-        just_released = ~self.agent.is_grasping(self.cube) & self.has_lifted_once & ~self.has_released
+        just_released = ~is_grasping & self.has_lifted_once & ~self.has_released
         self.has_released = self.has_released | just_released
 
         success = has_landed & in_goal_region & self.has_lifted_once
 
-
-        fail = cube_height < 0.0
+        # update grasp step counter
+        currently_grasping_after_lift = is_grasping & self.has_lifted_once & ~self.has_released
+        self.grasp_step_counter[currently_grasping_after_lift] += 1
+        self.grasp_step_counter[~currently_grasping_after_lift] = 0
+        max_grasp_steps = self.env_cfg.max_grasp_time
+        grasp_timeout = (
+            self.has_lifted_once & 
+            is_grasping & 
+            (self.grasp_step_counter > max_grasp_steps)
+        )
+  
+        fail = grasp_timeout
 
         return {
             "success": success,
@@ -208,7 +223,29 @@ class TestTaskEnv(BaseEnv):
         return obs
 
 
-    def _compute_velocity_reward(self, goal_pos: Array, cube_pos: Array):
+
+    def _compute_cube_velocity_reward(self, cube_velocity, goal_pos, cube_pos):
+        # Calculate optimal release conditions
+        cube_to_goal_xy = goal_pos[:, :2] - cube_pos[:, :2]
+        distance_to_goal_xy = torch.linalg.norm(cube_to_goal_xy, dim=1)
+        
+        # TCP velocity for momentum transfer
+        cube_velocity_xy = cube_velocity[:, :2]
+        cube_vel_magnitude = torch.linalg.norm(cube_velocity_xy, dim=1)
+        cube_vel_direction = cube_velocity_xy / (cube_vel_magnitude.unsqueeze(-1) + 1e-6)
+        goal_direction = cube_to_goal_xy / (distance_to_goal_xy.unsqueeze(-1) + 1e-6)
+        
+        # Reward for cube moving in the right direction before release
+        cube_alignment = (cube_vel_direction * goal_direction).sum(dim=1)
+        cube_direction_reward = torch.clamp(cube_alignment, 0, 1) * 15.0
+
+        # Reward for TCP velocity magnitude (for momentum transfer)
+        cube_speed_reward = torch.tanh(cube_vel_magnitude * 0.5) * 20.0
+        
+        return cube_direction_reward, cube_speed_reward
+
+
+    def _compute_tcp_velocity_reward(self, goal_pos: Array, cube_pos: Array):
         # Calculate optimal release conditions
         cube_to_goal_xy = goal_pos[:, :2] - cube_pos[:, :2]
         distance_to_goal_xy = torch.linalg.norm(cube_to_goal_xy, dim=1)
@@ -272,7 +309,7 @@ class TestTaskEnv(BaseEnv):
                 lifting_reward[stage1_mask]
             )
 
-        # Stage 2: Release and throw (after lifted once)
+        # Stage 2: Prepare for release
         stage2_mask = has_lifted_once & ~has_released
         if stage2_mask.any():
 
@@ -304,41 +341,55 @@ class TestTaskEnv(BaseEnv):
             tcp_speed_reward = torch.tanh(tcp_vel_magnitude * 0.5) * 20.0
             
             # Height-based release timing reward
-            optimal_release_height = self.env_cfg.table_height + self.env_cfg.lift_height * 0.8
+            optimal_release_height = self.env_cfg.table_height + self.env_cfg.lift_height * 0.5
             height_difference = torch.abs(cube_pos[:, 2] - optimal_release_height)
             height_timing_reward = torch.exp(-height_difference * 2.0) * 5.0
+
+            # joint vel reward
+            joint_vel = self.agent.robot.get_qvel()[..., :-2]
+            joint_vel_magnitude = torch.linalg.norm(joint_vel, dim=1)
+            joint_vel_reward = torch.tanh(joint_vel_magnitude * 0.5) * 10.0
             
             # Apply rewards to grasping agents
             grasping_mask = stage2_mask & is_grasping
             reward[grasping_mask] += (
                 tcp_direction_reward[grasping_mask] + 
                 tcp_speed_reward[grasping_mask] + 
-                height_timing_reward[grasping_mask] - too_close_penalty[grasping_mask]
+                height_timing_reward[grasping_mask] - too_close_penalty[grasping_mask] + joint_vel_reward[grasping_mask]
             )
             
             # Penalize slow movement when grasping
             reward[grasping_mask] -= torch.exp(-tcp_vel_magnitude[grasping_mask]) * 2.0
 
-            still_grasping_penalty = (1.0 + 5.0 * torch.exp(-(tcp_to_goal_xy_dist-0.2)*3)) * 8.0
-            reward[grasping_mask] -= still_grasping_penalty[grasping_mask]
+        # Stage 3: Just Release
+        stage3_mask = info['just_released']
+        if stage3_mask.any():
+            cube_direction_reward, cube_speed_reward = self._compute_cube_velocity_reward(cube_velocity, goal_pos, cube_pos)
+            reward[stage3_mask] += cube_direction_reward[stage3_mask] + cube_speed_reward[stage3_mask]
 
-            just_released_mask = (~is_grasping) & has_lifted_once & (~info["has_released"])
-            reward[just_released_mask] += 20.0
+            # joint vel reward
+            joint_vel = self.agent.robot.get_qvel()[..., :-2]
+            joint_vel_magnitude = torch.linalg.norm(joint_vel, dim=1)
+            joint_vel_reward = torch.tanh(joint_vel_magnitude * 0.5) * 10.0
+
+            reward[stage3_mask] += joint_vel_reward[stage3_mask]
+
             
+        # reward for NOT grasping (i.e., released)
+        released = ~is_grasping & has_lifted_once
+        reward[released] += 7.0  
+
+        # penalty for still grasping
+        still_grasping = is_grasping & has_lifted_once
+        reward[still_grasping] -= 7.0  
 
         # Stage 3: After release
-        stage3_mask = has_released
-        if stage3_mask.any():
+        stage4_mask = has_released
+        if stage4_mask.any():
             static_reward = 1 - torch.tanh(
                 5 * torch.linalg.norm(self.agent.robot.get_qvel()[..., :-2], dim=1)
             )
-            reward[stage3_mask] += static_reward[stage3_mask] * 10.0
-
-        # get cube velocity# 1. PENALIZE TCP getting too close to goal (prevent extending)
-        tcp_to_goal_xy_dist = torch.linalg.norm(goal_pos[:, :2] - tcp_pos[:, :2], dim=1)
-        min_throwing_distance = 0.3  # Minimum distance to maintain from goal
-        too_close_penalty = torch.exp(-tcp_to_goal_xy_dist / min_throwing_distance) * 20.0
-        reward[stage3_mask] -= too_close_penalty[stage3_mask]
+            reward[stage4_mask] += static_reward[stage4_mask] * 10.0
 
         
         # success
@@ -347,7 +398,6 @@ class TestTaskEnv(BaseEnv):
 
         # far penalty
         return reward
-        
     
 
     def compute_normalized_dense_reward(self, obs: Any, action: Array, info: Dict):
