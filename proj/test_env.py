@@ -71,8 +71,8 @@ class TestTaskEnv(BaseEnv):
         )
         # walls
         wall_pose_offsets = [
-            [0, self.env_cfg.bin_bottom_halfsize[1] - self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],   # front
-            #[0, -self.env_cfg.bin_bottom_halfsize[1] + self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],  # back
+            #[0, self.env_cfg.bin_bottom_halfsize[1] - self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],   # front
+            [0, -self.env_cfg.bin_bottom_halfsize[1] + self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],  # back
             [self.env_cfg.bin_bottom_halfsize[0] - self.env_cfg.bin_wall_halfsize[1], 0, self.env_cfg.bin_wall_halfsize[2]],   # right
             [-self.env_cfg.bin_bottom_halfsize[0] + self.env_cfg.bin_wall_halfsize[1], 0, self.env_cfg.bin_wall_halfsize[2]],  # left
         ]
@@ -240,7 +240,7 @@ class TestTaskEnv(BaseEnv):
         self.grasp_point = self._get_bin_grasp_points()
         
 
-        success = is_grasping & is_cube_on_table & ~is_cube_in_bin
+        success = is_grasping & is_cube_on_table & ~is_cube_in_bin & is_bin_in_goal_region
 
 
         return {
@@ -299,14 +299,15 @@ class TestTaskEnv(BaseEnv):
 
         # Goal reaching reward
         bin_to_goal_dist = torch.linalg.norm(goal_pos - bin_pos, dim=1)
-        goal_reaching_reward = (1 - torch.tanh(5.0 * bin_to_goal_dist)) * 1.0 * is_grasping * ~info['cube_in_bin']
+        goal_reaching_reward = (1 - torch.tanh(5.0 * bin_to_goal_dist)) * 8.0 * is_grasping * ~info['cube_in_bin'] * info['cube_on_table']
 
 
         # Put cube out reward
-        dump_reward = info['cube_on_table'] * ~info['cube_in_bin'] * is_grasping * 8.0
+        dump_reward = info['cube_on_table'] * ~info['cube_in_bin'] * is_grasping * 2.0
+        complete_task_reward = info['cube_on_table'] * ~info['cube_in_bin'] * is_grasping * info['bin_in_goal_region'] * 10.0
 
 
-        reward = reaching_reward + grasping_reward  + dump_reward 
+        reward = reaching_reward + grasping_reward  + dump_reward + goal_reaching_reward + complete_task_reward
 
         # check if success
         if 'success' in info:
