@@ -17,7 +17,7 @@ class TestEnvConfig:
 
     # target config
     goal_radius: float = 0.10
-    goal_distance: float = 0.0
+    goal_distance: float = -0.15
     
 
     # camera config
