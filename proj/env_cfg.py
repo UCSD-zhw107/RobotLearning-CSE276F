@@ -3,7 +3,7 @@ from typing import Sequence
 import numpy as np
 
 @dataclass
-class TestEnvConfig:
+class DumpPlaceEnvConfig:
 
     # scene config
     table_height: float = 1e-3

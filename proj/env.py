@@ -11,17 +11,17 @@ from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.wrappers.record import RecordEpisode
 import torch
 from transforms3d.euler import euler2quat
-from test_env_cfg import TestEnvConfig
+from env_cfg import DumpPlaceEnvConfig
 from mani_skill.utils.building import actors
 from typing import Any, Dict
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
 
-@register_env("WorkEnv-v1", max_episode_steps=200, override=True)
-class WorkEnv(BaseEnv):
+@register_env("DumpPlace-v1", max_episode_steps=200, override=True)
+class DumpPlaceEnv(BaseEnv):
 
     def __init__(self, *args, robot_uids="panda", **kwargs):
-        self.env_cfg = TestEnvConfig()
+        self.env_cfg = DumpPlaceEnvConfig()
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
 
@@ -71,13 +71,13 @@ class WorkEnv(BaseEnv):
         )
         # walls
         wall_pose_offsets = [
-            [0, self.env_cfg.bin_bottom_halfsize[1] - self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],   # front
+            #[0, self.env_cfg.bin_bottom_halfsize[1] - self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],   # front
             [0, -self.env_cfg.bin_bottom_halfsize[1] + self.env_cfg.bin_wall_halfsize[1], self.env_cfg.bin_wall_halfsize[2]],  # back
             [self.env_cfg.bin_bottom_halfsize[0] - self.env_cfg.bin_wall_halfsize[1], 0, self.env_cfg.bin_wall_halfsize[2]],   # right
             [-self.env_cfg.bin_bottom_halfsize[0] + self.env_cfg.bin_wall_halfsize[1], 0, self.env_cfg.bin_wall_halfsize[2]],  # left
         ]
         for i, offset in enumerate(wall_pose_offsets):
-            if i >= 2:  
+            if i >= 1:  
                 quat = sapien.Pose(q=[np.cos(np.pi/4), 0, 0, np.sin(np.pi/4)]).q  
             else:  
                 quat = [1, 0, 0, 0]  
@@ -186,7 +186,7 @@ class WorkEnv(BaseEnv):
         
         
         #wall_height = self.env_cfg.bin_wall_halfsize[2] 
-        wall_height = 0.00
+        wall_height = 0.03
         wall_thickness = self.env_cfg.bin_wall_halfsize[1]  
         
         
@@ -198,7 +198,7 @@ class WorkEnv(BaseEnv):
         }
 
         # use front wall grasp point as default
-        return grasp_points['left'], grasp_points['right']
+        return grasp_points['left']
 
 
     def _is_cube_in_bin(self):
@@ -226,26 +226,31 @@ class WorkEnv(BaseEnv):
         # check if cube in bin
         is_cube_in_bin = self._is_cube_in_bin()
         
-        # check if bin in goal region
-        distance_xy_to_goal = torch.linalg.norm(cube_pos[..., :2] - goal_pos[..., :2], dim=1)
-        is_bin_in_goal_region = distance_xy_to_goal < self.env_cfg.goal_radius
+        # check if cube in goal region
+        distance_cube_to_goal = torch.linalg.norm(cube_pos[..., :2] - goal_pos[..., :2], dim=1)
+        is_cube_on_table = cube_pos[..., 2] <= self.env_cfg.table_height + self.env_cfg.cube_halfsize + 1e-3
+        is_cube_in_goal_region = (distance_cube_to_goal < self.env_cfg.goal_radius) & is_cube_on_table
 
         # check if bin on table
         is_bin_on_table = bin_pos[..., 2] <= self.env_cfg.table_height + self.env_cfg.bin_wall_halfsize[2] + 1e-3
+        distance_bin_to_goal = torch.linalg.norm(bin_pos[..., :2] - goal_pos[..., :2], dim=1)
+        is_bin_in_goal_region = (distance_bin_to_goal < self.env_cfg.goal_radius) & is_bin_on_table
 
         # get grasp points
-        self.grasp_point_left, self.grasp_point_right = self._get_bin_grasp_points()
+        self.grasp_point = self._get_bin_grasp_points()
         
 
-        success = is_cube_in_bin & is_bin_in_goal_region & is_bin_on_table
+        success = is_grasping & is_cube_on_table & ~is_cube_in_bin & is_bin_in_goal_region
 
 
         return {
             "success": success,
-            "bin_in_goal_region": is_bin_in_goal_region,
+            "cube_in_goal_region": is_cube_in_goal_region,
             "cube_in_bin": is_cube_in_bin,
             "bin_on_table": is_bin_on_table,
             "is_grasping": is_grasping,
+            "bin_in_goal_region": is_bin_in_goal_region,
+            "cube_on_table": is_cube_on_table,
         }
     
 
@@ -257,8 +262,8 @@ class WorkEnv(BaseEnv):
                 cube_pose=self.cube.pose.raw_pose,
                 bin_pose=self.bin.pose.raw_pose,
                 goal_pos=self.goal_region.pose.p,
-                #grasp_point=self.grasp_point,
-                #tcp_to_grasp=self.grasp_point - self.agent.tcp.pose.p,
+                grasp_point=self.grasp_point,
+                tcp_to_grasp=self.grasp_point - self.agent.tcp.pose.p,
                 tcp_to_bin_pos=self.bin.pose.p - self.agent.tcp.pose.p,
                 bin_to_goal_pos=self.goal_region.pose.p - self.bin.pose.p,
                 cube_to_bin_pos=self.bin.pose.p - self.cube.pose.p,
@@ -273,7 +278,7 @@ class WorkEnv(BaseEnv):
         bin_pos = self.bin.pose.p
         goal_pos = self.goal_region.pose.p
         tcp_pos = self.agent.tcp.pose.p
-        #grasp_point = self.grasp_point
+        grasp_point = self.grasp_point
         is_grasping = self.agent.is_grasping(self.bin)
         reward = torch.zeros(self.num_envs, device=self.device)
         gripper_width = (self.agent.robot.get_qlimits()[0, -1, 1] * 2).to(
@@ -281,26 +286,28 @@ class WorkEnv(BaseEnv):
         )
 
         # Reaching and grasping reward
-        # determine which grasp point to use
-        tcp_to_grasp_dist_left = torch.linalg.norm(self.grasp_point_left - tcp_pos, dim=1)
-        tcp_to_grasp_dist_right = torch.linalg.norm(self.grasp_point_right - tcp_pos, dim=1)
-        #tcp_to_grasp_dist = torch.minimum(tcp_to_grasp_dist_left, tcp_to_grasp_dist_right)
-        tcp_to_grasp_dist = tcp_to_grasp_dist_left
+        tcp_to_grasp_dist = torch.linalg.norm(grasp_point - tcp_pos, dim=1)
         reaching_reward = (1 - torch.tanh(5.0 * tcp_to_grasp_dist))
         ungrasp_reward = (
             torch.sum(self.agent.robot.get_qpos()[:, -2:], axis=1) / gripper_width
-        ) * (tcp_to_grasp_dist >= 0.05) 
+        )
         reaching_reward = reaching_reward * 0.5
         grasping_reward = is_grasping * 3.0
 
-        # Cube in Bin reward
-        cube_in_bin_reward = info['cube_in_bin'] * is_grasping
+        # Cube in Bin reward before goal region
+        #cube_in_bin_reward = info['cube_in_bin'] * is_grasping * ~info['bin_in_goal_region']
 
         # Goal reaching reward
         bin_to_goal_dist = torch.linalg.norm(goal_pos - bin_pos, dim=1)
-        goal_reaching_reward = (1 - torch.tanh(5.0 * bin_to_goal_dist)) * 5.0 * is_grasping
-        
-        reward = reaching_reward + grasping_reward + cube_in_bin_reward + goal_reaching_reward 
+        goal_reaching_reward = (1 - torch.tanh(5.0 * bin_to_goal_dist)) * 8.0 * is_grasping * ~info['cube_in_bin'] * info['cube_on_table']
+
+
+        # Put cube out reward
+        dump_reward = info['cube_on_table'] * ~info['cube_in_bin'] * is_grasping * 2.0
+        complete_task_reward = info['cube_on_table'] * ~info['cube_in_bin'] * is_grasping * info['bin_in_goal_region'] * 10.0
+
+
+        reward = reaching_reward + grasping_reward  + dump_reward + goal_reaching_reward + complete_task_reward
 
         # check if success
         if 'success' in info:

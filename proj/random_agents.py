@@ -11,7 +11,7 @@ from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.wrappers.record import RecordEpisode
 import torch
 from transforms3d.euler import euler2quat
-from test_env import TestTaskEnv
+from env import DumpPlaceEnv
 import mani_skill
 
 """
@@ -19,7 +19,7 @@ This script is used to test the demo agents with random actions.
 """
 
 def main():
-    env = gym.make("TestTask-v1",
+    env = gym.make("DumpPlace-v1",
                 num_envs=1,
                 control_mode="pd_joint_delta_pos",
                 render_mode="rgb_array",

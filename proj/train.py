@@ -21,7 +21,7 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
-from test_env import TestTaskEnv
+from env import DumpPlaceEnv
 
 @dataclass
 class Args:
